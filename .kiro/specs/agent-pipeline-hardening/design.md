@@ -1468,3 +1468,234 @@ For every Groq prompt assembled by the orchestrator or any agent, the prompt bod
   - `ENABLE_VISUALIZATION` env var, defaults to `false`. When `false`, the visualization agent is registered as disabled and the compiler refuses to insert a visualize step.
   - `LOW_CONFIDENCE_POLICY` env var, one of `warn`, `fail`, `quarantine`, defaults to `fail`.
   - `CONFIDENCE_THRESHOLD` constant in `tools/column_resolver.py`, defaults to `0.75`. Configurable per-deployment via env override if needed.
+
+---
+
+## Hybrid Semantic Extraction Pipeline (Phase 2 Extension)
+
+### Problem Statement
+
+The original canonical-intent extractor relied on keyword lists, regexes, and phrase-specific rules. This caused valid user requests to be partially lost when they used unexpected wording. For example:
+
+```text
+clean this data and return all columns except consumer ID
+```
+
+The extractor produced only a `clean` action because it did not understand the negative projection phrasing. Adding `"except"` to a verb list is insufficient — there are unlimited equivalent phrasings:
+
+```text
+return everything except consumer ID
+hide consumer ID
+consumer ID should not appear
+all fields other than consumer ID
+give me the remaining columns after removing consumer ID
+```
+
+### Solution: Constrained Semantic Understanding
+
+Replace phrase-by-phrase keyword expansion with a constrained semantic-understanding architecture. The LLM understands arbitrary user phrasing, but it is NOT allowed to directly create executable plans, agent names, or tool calls. Deterministic code continues to own compilation, validation, grounding, and execution.
+
+### Architecture
+
+```mermaid
+graph TD
+    A[Raw User Prompt] --> B{Deterministic Fast-Path?}
+    B -->|High confidence, simple syntax| C[Regex/Keyword Extraction]
+    B -->|Complex or ambiguous| D[Constrained LLM Extraction]
+    D -->|Schema-validated JSON| E[SemanticIntent]
+    C -->|Fallback path| F[Legacy CanonicalIntent]
+    E --> G[Semantic Normalizer]
+    G --> H[Coverage Verification]
+    H -->|Missing requirements| I[Bounded Repair - max 1 attempt]
+    I --> H
+    H -->|All covered| J[Schema & Column Grounding]
+    J -->|Unresolved| K[needs_clarification]
+    J -->|All resolved| L[Semantic-to-Canonical Compiler]
+    L --> F
+    F --> M[Existing Pipeline: Compiler → Validator → Engine → Agents]
+```
+
+### Semantic Intermediate Representation
+
+The LLM extraction step produces typed semantic models that describe user meaning without referencing internal execution:
+
+```python
+class SemanticIntent(BaseModel):
+    goals: list[SemanticGoal]
+    tasks: list[SemanticTask]
+    outputs: list[OutputRequirement]
+    constraints: list[SemanticConstraint]
+    ambiguities: list[SemanticAmbiguity]
+    unsupported_requirements: list[UnsupportedRequirement]
+
+class SemanticTask(BaseModel):
+    task_id: str
+    operation: SemanticOperation  # e.g. clean, exclude_columns, filter, sort
+    inputs: list[SemanticReference]
+    parameters: dict
+    depends_on: list[str]
+    confidence: float | None
+```
+
+### Supported Semantic Operations
+
+| Operation | Meaning | Canonical Action |
+|-----------|---------|-----------------|
+| `clean` | Data cleaning/normalization | `clean` |
+| `select_columns` | Keep only specified columns | `project_columns` |
+| `exclude_columns` | Remove specified columns | `drop_columns` |
+| `filter` | Filter rows by conditions | `filter_rows` |
+| `sort` | Order rows | `sort_rows` |
+| `limit` | Limit row count | `limit_rows` |
+| `aggregate` | Compute aggregations | `calculate` |
+| `visualize` | Create charts | `visualize` |
+| `deduplicate` | Remove duplicate rows | `clean` (with deduplicate op) |
+| `rename_columns` | Rename columns | `rename_columns` |
+| `export` / `format` | Output formatting | `report` |
+
+### Supported Relation Operators
+
+`equals`, `not_equals`, `greater_than`, `greater_than_or_equal`, `less_than`, `less_than_or_equal`, `between`, `in`, `not_in`, `contains`, `not_contains`, `matches`, `is_null`, `is_not_null`, `belongs_to`
+
+### Pipeline Stages
+
+#### Stage 1: Constrained LLM Extraction (`semantic_extractor.py`)
+
+The LLM receives:
+- The raw user prompt
+- Available dataset columns with types
+- Supported operations enum
+- Supported relation operators enum
+- Explicit instructions: no code, no agent names, no inventing columns, preserve all requirements, mark ambiguity
+
+Returns schema-validated `SemanticIntent` JSON. Model: `llama-3.3-70b-versatile` via Groq with `response_format=json_object` and `temperature=0`.
+
+#### Stage 2: Semantic Normalization (`semantic_normalizer.py`)
+
+- Merges duplicate tasks (e.g. multiple exclude_columns → one)
+- Normalizes operator synonyms to canonical `RelationOperator` values
+- Assigns unique task IDs
+- Fixes invalid dependency references
+
+#### Stage 3: Coverage Verification (`semantic_coverage.py`)
+
+Verifies every material requirement from the raw prompt is represented. Uses deterministic pattern detection:
+- Exclusion intent (except, hide, without, etc.) → requires `exclude_columns` task
+- Selection intent (only, just + column names) → requires `select_columns` task
+- Filter intent (where, equals, greater than, etc.) → requires `filter` task
+- Clean intent (clean, normalize, deduplicate) → requires `clean` task
+
+Key distinction: "return only those which have credit score > 600" is a **filter** (row selection), NOT column selection — even though it contains "only."
+
+#### Stage 4: Bounded Repair (`semantic_repair.py`)
+
+If coverage fails:
+1. Run ONE repair LLM call with: original prompt + current extraction + identified gap
+2. Merge typed additions into the SemanticIntent
+3. Re-validate coverage
+4. If still incomplete → return `needs_clarification` (fail closed)
+
+Maximum 1 repair attempt. No infinite loops.
+
+#### Stage 5: Schema & Column Grounding (`semantic_grounding.py`)
+
+Resolves user-facing terms against actual dataset columns using tiered matching:
+1. Exact match (case-insensitive) → confidence 1.0
+2. Normalized match (underscores/spaces) → confidence 0.95
+3. Semantic synonym match → confidence 0.85+
+4. Fuzzy match (difflib) → confidence varies
+
+Rules:
+- High-confidence unique match → resolve
+- Multiple plausible matches → `needs_clarification`
+- No valid match → `needs_clarification`
+- Never silently remove or invent columns
+
+#### Stage 6: Deterministic Compilation (`semantic_compiler.py`)
+
+Maps semantic operations to canonical intent actions:
+- `exclude_columns` → `drop_columns`
+- `select_columns` → `project_columns`
+- `filter` with `between` → decomposed into `gte` + `lte` conditions
+- `filter` with `in` → `eq` with list value
+
+The LLM never touches this layer.
+
+### Integration with Existing Pipeline
+
+The hybrid pipeline integrates into `build_canonical_intent()` in `backend/app/services/canonical_intent.py`:
+
+```python
+def build_canonical_intent(...):
+    # Try semantic pipeline first (if GROQ_API_KEY is set)
+    semantic_result = _try_semantic_extraction(instruction, source_columns, ...)
+    if semantic_result is not None:
+        return semantic_result  # resolved CanonicalIntent dict
+
+    # Fallback: deterministic regex extraction (original path)
+    ...
+```
+
+The semantic pipeline produces the same `CanonicalIntent` dict shape. Downstream compiler, workers, and executors are unchanged — they operate only on typed canonical data.
+
+### Fail-Closed Behavior
+
+Execution is blocked when:
+- Missing requirements detected and repair fails
+- Unresolved column references after grounding
+- Conflicting tasks detected
+- Unsupported operations requested
+- LLM extraction fails or returns invalid schema
+
+Status codes: `needs_clarification`, `unsupported`, `invalid_canonical_intent`, `semantic_coverage_failed`, `ambiguous_reference`
+
+### Observability
+
+Persisted per extraction:
+- Semantic schema version
+- Extraction model identifier
+- Raw semantic output (validated)
+- Coverage verification result
+- Repair result (if triggered)
+- Grounding candidates with confidence scores
+- Final canonical intent hash
+
+### Dispatch Timestamp Fix
+
+The `enqueue_submission_dispatch()` function now sets `submission.dispatched_at = datetime.now(UTC)` immediately after successfully enqueuing the job to Redis. This ensures the frontend step timeline accurately reflects the real dispatch event rather than relying on inference.
+
+### Files Added
+
+| File | Purpose |
+|------|---------|
+| `backend/app/services/semantic_models.py` | Typed semantic intermediate representation |
+| `backend/app/services/semantic_extractor.py` | Constrained LLM extraction with schema validation |
+| `backend/app/services/semantic_normalizer.py` | Deterministic normalization of equivalent forms |
+| `backend/app/services/semantic_grounding.py` | Column reference resolution with confidence scoring |
+| `backend/app/services/semantic_coverage.py` | Coverage verification (catches omitted requirements) |
+| `backend/app/services/semantic_repair.py` | Bounded repair (max 1 attempt) |
+| `backend/app/services/semantic_compiler.py` | Deterministic semantic-to-canonical compilation |
+| `backend/app/services/semantic_pipeline.py` | Pipeline orchestrator (wires all stages together) |
+| `agent-framework/.../storage/__init__.py` | Storage package init |
+| `agent-framework/.../storage/file_store.py` | Safe file resolution for agent service |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `backend/app/services/canonical_intent.py` | Added `_try_semantic_extraction()` integration point |
+| `backend/app/services/agent_dispatcher.py` | Set `dispatched_at` on successful job enqueue |
+| `backend/app/api/uploads.py` | Step timeline uses `dispatched_at` truthfully |
+| `agent-framework/.../agent-service .env` | Added `AGENT_CALLBACK_SECRET`, `BACKEND_BASE_URL` |
+
+### Test Families Added
+
+| File | Coverage |
+|------|----------|
+| `backend/tests/test_semantic_paraphrases.py` | 8 negative-projection phrasings, 4 positive-projection, 4 range, 3 membership, 4 clean+exclude |
+| `backend/tests/test_semantic_adversarial.py` | "except" as conditional, multi-task, contradictions, unknown columns, unsupported ops |
+| `backend/tests/test_semantic_invariants.py` | Coverage detection, grounding guarantees, compilation blocking, normalization idempotency |
+
+### Core Architectural Rule (Preserved)
+
+There remains one semantic authority. Downstream agents, workers, compiler code, and executors do not reinterpret the raw prompt. The canonical-intent subsystem internally uses bounded extraction, validation, and repair stages, but the output to the rest of the pipeline is always a typed `CanonicalIntent`.

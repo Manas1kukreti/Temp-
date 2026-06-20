@@ -307,6 +307,231 @@ def build_capability_snapshot() -> CapabilitySnapshot:
     )
 
 
+def _try_semantic_extraction(
+    instruction: str,
+    source_columns: list[str],
+    *,
+    output_format: str = "xlsx",
+    detected_types: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Try the hybrid semantic extraction pipeline.
+
+    Returns a canonical intent dict if semantic extraction succeeds,
+    or None to fall back to deterministic regex extraction.
+    """
+    import os
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Only use semantic pipeline if GROQ_API_KEY is configured
+    if not os.environ.get("GROQ_API_KEY", ""):
+        return None
+
+    # Don't use semantic pipeline for empty instructions
+    if not instruction or not instruction.strip():
+        return None
+
+    try:
+        from app.services.semantic_pipeline import run_semantic_pipeline_sync
+
+        result = run_semantic_pipeline_sync(
+            instruction,
+            source_columns,
+            column_types=detected_types,
+            output_format=output_format,
+        )
+
+        if not result.success:
+            # Semantic extraction couldn't fully resolve — fall back to regex
+            logger.info(
+                "Semantic extraction did not fully resolve; falling back to deterministic: %s",
+                result.error,
+            )
+            return None
+
+        # Build a canonical intent from the semantic result
+        canonical_actions = result.canonical_actions
+        if not canonical_actions:
+            return None
+
+        # Convert semantic actions to typed IntentAction models
+        typed_actions = _semantic_actions_to_typed(canonical_actions, source_columns)
+        if not typed_actions:
+            return None
+
+        dataframe_profile = _build_dataframe_profile(source_columns, [], detected_types or {})
+        capability_snapshot_model = build_capability_snapshot()
+
+        grounded_references = _iter_grounded_references(typed_actions)
+        has_unresolved = any(
+            not item.get("resolved_column") and not item.get("resolved_columns")
+            for item in grounded_references
+        )
+
+        if has_unresolved:
+            resolution_status = "needs_clarification"
+        elif result.repair_notes:
+            resolution_status = "repaired"
+        else:
+            resolution_status = "resolved"
+
+        canonical = CanonicalIntent(
+            schema_version="2.0",
+            intent_hash="",
+            original_prompt=str(instruction or ""),
+            normalized_prompt=_normalize_text(instruction),
+            resolution_status=resolution_status,
+            decision=_build_decision_summary(typed_actions),
+            evidence=_dedupe_preserve_order(result.evidence),
+            alternatives_considered=[],
+            actions=typed_actions,
+            output_format=output_format if output_format in {"xlsx", "csv", "json", "txt"} else "xlsx",
+            assumptions=_dedupe_preserve_order(result.assumptions),
+            repair_notes=_dedupe_preserve_order(result.repair_notes),
+            dataframe_profile=dataframe_profile,
+            capability_version=capability_snapshot_model.capability_version,
+            capability_snapshot=capability_snapshot_model.model_dump(mode="json"),
+            grounded_at=datetime.now(UTC),
+        )
+        canonical.intent_hash = compute_intent_hash(canonical)
+        logger.info("Semantic extraction succeeded for: %s", instruction[:80])
+        return canonical.model_dump(mode="json")
+
+    except Exception as e:
+        logger.warning("Semantic extraction failed, falling back to deterministic: %s", e)
+        return None
+
+
+def _semantic_actions_to_typed(
+    canonical_actions: list[dict[str, Any]],
+    source_columns: list[str],
+) -> list[IntentAction]:
+    """Convert compiled semantic actions (dicts) into typed IntentAction models."""
+    typed: list[IntentAction] = []
+    for action in canonical_actions:
+        if not isinstance(action, dict):
+            continue
+        kind = str(action.get("kind", "")).strip()
+        try:
+            if kind == "clean":
+                operations = []
+                for op in action.get("operations", []):
+                    if isinstance(op, dict):
+                        operations.append(CleaningIntentOperation(
+                            name=str(op.get("name", "")),
+                            parameters=op.get("parameters", {}),
+                        ))
+                typed.append(CleanIntent(
+                    kind="clean",
+                    mode=action.get("mode", "safe_default"),
+                    operations=operations,
+                ))
+            elif kind == "drop_columns":
+                fields = _dict_fields_to_unresolved(action.get("requested_fields", []), source_columns)
+                if fields:
+                    typed.append(DropColumnsIntent(kind="drop_columns", requested_fields=fields))
+            elif kind == "project_columns":
+                fields = _dict_fields_to_unresolved(action.get("requested_fields", []), source_columns)
+                if fields:
+                    typed.append(ProjectColumnsIntent(kind="project_columns", requested_fields=fields))
+            elif kind == "filter_rows":
+                conditions = _dict_conditions_to_typed(action.get("conditions", []), source_columns)
+                if conditions:
+                    typed.append(FilterRowsIntent(
+                        kind="filter_rows",
+                        mode=action.get("mode", "keep"),
+                        conditions=conditions,
+                        logic=action.get("logic", "and"),
+                    ))
+            elif kind == "sort_rows":
+                sort_keys = []
+                for sk in action.get("sort_keys", []):
+                    if isinstance(sk, dict):
+                        col_ref = sk.get("column", {})
+                        ref = _single_dict_to_unresolved(col_ref, source_columns)
+                        if ref:
+                            sort_keys.append(SortKey(column=ref, direction=sk.get("direction", "asc")))
+                if sort_keys:
+                    typed.append(SortRowsIntent(kind="sort_rows", sort_keys=sort_keys))
+            elif kind == "limit_rows":
+                try:
+                    limit = int(action.get("limit", 0))
+                    typed.append(LimitRowsIntent(kind="limit_rows", limit=max(0, limit)))
+                except (TypeError, ValueError):
+                    pass
+            elif kind == "calculate":
+                typed.append(CalculateIntent(kind="calculate", operations=action.get("operations", [])))
+            elif kind == "visualize":
+                fields = _dict_fields_to_unresolved(action.get("fields", []), source_columns)
+                typed.append(VisualizeIntent(
+                    kind="visualize",
+                    chart_type=action.get("chart_type"),
+                    fields=fields,
+                ))
+            elif kind == "report":
+                typed.append(ReportIntent(kind="report", sections=action.get("sections", [])))
+        except Exception:
+            continue
+    return typed
+
+
+def _dict_fields_to_unresolved(
+    fields: list[dict[str, Any] | Any],
+    source_columns: list[str],
+) -> list[UnresolvedColumnReference]:
+    """Convert dict-based field references to UnresolvedColumnReference objects."""
+    result: list[UnresolvedColumnReference] = []
+    for field in fields:
+        ref = _single_dict_to_unresolved(field, source_columns)
+        if ref:
+            result.append(ref)
+    return result
+
+
+def _single_dict_to_unresolved(
+    field: dict[str, Any] | Any,
+    source_columns: list[str],
+) -> UnresolvedColumnReference | None:
+    """Convert a single dict field reference to an UnresolvedColumnReference."""
+    if not isinstance(field, dict):
+        return None
+    raw_ref = str(field.get("raw_reference", "")).strip()
+    resolved = str(field.get("resolved_column", "")).strip() or None
+    method = str(field.get("resolution_method", "")).strip() or None
+    if not raw_ref and not resolved:
+        return None
+    return UnresolvedColumnReference(
+        raw_reference=raw_ref or (resolved or ""),
+        resolved_column=resolved,
+        resolution_method=method,
+    )
+
+
+def _dict_conditions_to_typed(
+    conditions: list[dict[str, Any]],
+    source_columns: list[str],
+) -> list[FilterCondition]:
+    """Convert dict-based filter conditions to typed FilterCondition objects."""
+    result: list[FilterCondition] = []
+    for cond in conditions:
+        if not isinstance(cond, dict):
+            continue
+        field_dict = cond.get("field", {})
+        field_ref = _single_dict_to_unresolved(field_dict, source_columns)
+        if not field_ref:
+            continue
+        operator = str(cond.get("operator", "eq")).strip()
+        if operator not in {"eq", "neq", "gt", "lt", "gte", "lte", "contains"}:
+            operator = "eq"
+        result.append(FilterCondition(
+            field=field_ref,
+            operator=operator,
+            value=cond.get("value"),
+        ))
+    return result
+
+
 def build_canonical_intent(
     source_columns: list[str],
     preview_rows: list[dict[str, Any]],
@@ -316,6 +541,21 @@ def build_canonical_intent(
     detected_types: dict[str, str] | None = None,
     capability_snapshot: CapabilitySnapshot | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # ---------------------------------------------------------------
+    # HYBRID SEMANTIC PIPELINE: Try semantic extraction first.
+    # Falls back to deterministic regex if semantic extraction fails
+    # or if GROQ_API_KEY is not configured.
+    # ---------------------------------------------------------------
+    source_columns = [str(column) for column in source_columns if str(column).strip()]
+    semantic_result = _try_semantic_extraction(
+        instruction, source_columns, output_format=output_format, detected_types=detected_types,
+    )
+    if semantic_result is not None:
+        return semantic_result
+
+    # ---------------------------------------------------------------
+    # FALLBACK: Deterministic regex-based extraction (original path)
+    # ---------------------------------------------------------------
     normalized_prompt = _normalize_text(instruction)
     source_columns = [str(column) for column in source_columns if str(column).strip()]
     dataframe_profile = _build_dataframe_profile(source_columns, preview_rows, detected_types or {})

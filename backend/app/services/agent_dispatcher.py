@@ -136,6 +136,8 @@ async def enqueue_submission_dispatch(submission_id: UUID | str, *, persist_revi
                 await db.commit()
 
             await redis.enqueue_job("process_job_task", payload)
+            submission.dispatched_at = datetime.now(timezone.utc)
+            await db.commit()
             if outbox is not None:
                 logger.info(
                     "event=canonical_job_enqueued submission_id=%s intent_schema_version=%s",

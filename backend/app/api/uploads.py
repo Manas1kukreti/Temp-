@@ -1935,7 +1935,7 @@ def build_job_steps(submission: Submission) -> list[JobStepRead]:
 
     return [
         JobStepRead(name="Ingestion", status="complete", summary="File upload accepted and staged.", time=uploaded_time),
-        JobStepRead(name="Workflow routing", status=queue_status, summary=queue_summary, time=dispatched_time if submission.dispatched_at else None),
+        JobStepRead(name="Workflow routing", status=queue_status, summary=queue_summary, time=dispatched_time or (reviewed_time if queue_status == "complete" else None)),
         JobStepRead(name="Agent execution" if not schema_review_pending else "Schema approval", status=execution_status, summary=build_agent_execution_summary(submission) if not schema_review_pending else "Review the proposed schema mapping and approve it to continue.", time=execution_time),
         JobStepRead(name="Output preparation", status=output_status, summary=output_summary, time=output_time),
     ]
