@@ -399,6 +399,33 @@ def _try_semantic_extraction(
         return canonical.model_dump(mode="json")
 
     except Exception as e:
+        error_str = str(e)
+        # If rate-limited, return an explicit error intent instead of falling back silently
+        if "rate_limit" in error_str or "429" in error_str:
+            logger.warning("Semantic extraction rate-limited: %s", e)
+            dataframe_profile = _build_dataframe_profile(source_columns, [], detected_types or {})
+            capability_snapshot_model = build_capability_snapshot()
+            canonical = CanonicalIntent(
+                schema_version="2.0",
+                intent_hash="",
+                original_prompt=str(instruction or ""),
+                normalized_prompt=_normalize_text(instruction),
+                resolution_status="needs_clarification",
+                decision="",
+                evidence=["LLM token rate limit reached. Please wait a few minutes and retry."],
+                alternatives_considered=[],
+                actions=[],
+                output_format=output_format if output_format in {"xlsx", "csv", "json", "txt"} else "xlsx",
+                assumptions=[],
+                repair_notes=["Rate limit exceeded on AI extraction service. Retry shortly."],
+                dataframe_profile=dataframe_profile,
+                capability_version=capability_snapshot_model.capability_version,
+                capability_snapshot=capability_snapshot_model.model_dump(mode="json"),
+                grounded_at=datetime.now(UTC),
+            )
+            canonical.intent_hash = compute_intent_hash(canonical)
+            return canonical.model_dump(mode="json")
+
         logger.warning("Semantic extraction failed, falling back to deterministic: %s", e)
         return None
 

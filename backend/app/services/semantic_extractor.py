@@ -48,111 +48,31 @@ SEMANTIC_SCHEMA_VERSION = "1.0"
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
-You are a structured data-operation intent extractor. Your job is to parse a user's \
-natural-language instruction about data manipulation and return a JSON object that \
-describes their intent using ONLY the supported operations and relation operators below.
+You are a data-operation intent extractor. Parse the user instruction into structured JSON.
 
-IMPORTANT RULES:
-- Preserve EVERY material user requirement. Do not silently omit anything.
-- Separate multiple requested operations into distinct tasks.
-- Preserve ordering and dependencies between tasks.
-- Mark ambiguity instead of guessing. If something is unclear, add it to ambiguities.
-- Mark unsupported requirements explicitly in unsupported_requirements.
-- NEVER choose internal executors, agents, or generate arbitrary code.
-- NEVER invent columns that are not in the provided column list.
-- If the user requests a column that doesn't exist in the provided list, still include \
-it as a column_reference with the user's exact term — grounding happens later.
-- Return ONLY valid JSON matching the schema. No explanations or markdown.
+RULES:
+- Preserve EVERY user requirement. Never silently omit.
+- Separate multiple operations into distinct tasks.
+- Mark ambiguity instead of guessing.
+- Never invent columns not in the provided list.
+- Return ONLY valid JSON. No explanations.
 
-SUPPORTED SEMANTIC OPERATIONS:
-- clean: General data cleaning (trimming, deduplication, normalization)
-- select_columns: Keep only specific columns (positive projection)
-- exclude_columns: Remove specific columns (negative projection)
-- filter: Filter rows based on conditions
-- compare: Compare values across columns
-- group: Group rows by column values
-- aggregate: Compute aggregations (sum, average, count, etc.)
-- derive_column: Create a new computed column
-- sort: Order rows by column values
-- join: Combine with another dataset
-- format: Format output in a specific way
-- visualize: Create charts or visualizations
-- export: Export data in specific format
-- limit: Limit the number of rows returned
-- rename_columns: Rename one or more columns
-- deduplicate: Remove duplicate rows
+OPERATIONS: clean, select_columns, exclude_columns, filter, aggregate, sort, limit, deduplicate, rename_columns, derive_column, visualize, export
 
-SUPPORTED RELATION OPERATORS (for filter predicates):
-- equals: exact match
-- not_equals: not equal
-- greater_than: >
-- greater_than_or_equal: >=
-- less_than: <
-- less_than_or_equal: <=
-- between: value in range [min, max]
-- in: value is one of a set
-- not_in: value is not in a set
-- contains: text contains substring
-- not_contains: text does not contain substring
-- matches: regex or pattern match
-- is_null: value is missing/null
-- is_not_null: value is present
+OPERATORS (for filter): equals, not_equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between, in, not_in, contains, not_contains, is_null, is_not_null
 
-CRITICAL DISTINCTIONS:
-- "return all columns except X" → operation: exclude_columns (NOT a filter)
-- "show only X and Y" → operation: select_columns (NOT a filter)
-- "where X equals Y" → operation: filter
-- "remove rows where X" → operation: filter (with the condition)
-- "remove column X" / "hide X" / "except X" → operation: exclude_columns
-- "except" in "do X except when Y" → this is a CONDITIONAL, not column exclusion
+KEY DISTINCTIONS:
+- "except X" / "hide X" / "without X" → exclude_columns
+- "only X and Y" → select_columns
+- "where X > Y" / "rows with" → filter
+- "except when Y" → conditional filter (NOT column exclusion)
 
-OUTPUT FORMAT:
-Return a JSON object with this structure:
-{
-  "goals": [{"description": "...", "priority": 1}],
-  "tasks": [
-    {
-      "task_id": "task_1",
-      "operation": {"type": "<semantic_operation>"},
-      "inputs": [{"kind": "column_reference", "user_term": "..."}],
-      "parameters": {},
-      "depends_on": [],
-      "confidence": 0.95
-    }
-  ],
-  "outputs": [{"format": "xlsx", "description": "..."}],
-  "constraints": [],
-  "ambiguities": [],
-  "unsupported_requirements": []
-}
+OUTPUT JSON:
+{"goals":[{"description":"...","priority":1}],"tasks":[{"task_id":"task_1","operation":{"type":"<op>"},"inputs":[{"kind":"column_reference","user_term":"..."}],"parameters":{},"depends_on":[],"confidence":0.95}],"outputs":[],"constraints":[],"ambiguities":[],"unsupported_requirements":[]}
 
-For filter operations, put the predicate in parameters:
-{
-  "task_id": "task_2",
-  "operation": {"type": "filter"},
-  "inputs": [{"kind": "column_reference", "user_term": "age"}],
-  "parameters": {
-    "predicate": {
-      "left": {"kind": "column_reference", "user_term": "age"},
-      "operator": "between",
-      "right": {"kind": "range_value", "minimum": 18, "maximum": 25}
-    }
-  }
-}
-
-For exclude_columns:
-{
-  "task_id": "task_1",
-  "operation": {"type": "exclude_columns"},
-  "inputs": [{"kind": "column_reference", "user_term": "consumer ID"}]
-}
-
-For select_columns:
-{
-  "task_id": "task_1",
-  "operation": {"type": "select_columns"},
-  "inputs": [{"kind": "column_reference", "user_term": "age"}, {"kind": "column_reference", "user_term": "gender"}]
-}
+For filter: parameters.predicate = {"left":{"kind":"column_reference","user_term":"col"},"operator":"<op>","right":{"kind":"literal_value","value":123}}
+For between: right = {"kind":"range_value","minimum":18,"maximum":25}
+For in: right = {"kind":"list_value","values":["a","b"]}
 """
 
 
@@ -199,7 +119,10 @@ def build_extraction_prompt(
 def parse_llm_semantic_response(raw_json: str | dict[str, Any]) -> SemanticIntent:
     """Parse and validate LLM output into a SemanticIntent.
 
-    Raises ValueError if the response is not valid.
+    Includes preprocessing to handle common LLM output inconsistencies:
+    - ambiguities as plain strings → convert to SemanticAmbiguity objects
+    - unsupported_requirements as plain strings → convert to objects
+    - depends_on as malformed strings → fix to proper lists
     """
     if isinstance(raw_json, str):
         try:
@@ -212,12 +135,86 @@ def parse_llm_semantic_response(raw_json: str | dict[str, Any]) -> SemanticInten
     if not isinstance(data, dict):
         raise ValueError(f"LLM returned non-object JSON: {type(data).__name__}")
 
+    # Preprocess: fix common LLM output issues before validation
+    data = _preprocess_llm_output(data)
+
     try:
         intent = SemanticIntent.model_validate(data)
     except ValidationError as e:
         raise ValueError(f"LLM response failed schema validation: {e}") from e
 
     return intent
+
+
+def _preprocess_llm_output(data: dict[str, Any]) -> dict[str, Any]:
+    """Fix common LLM output inconsistencies before Pydantic validation."""
+    # Fix ambiguities: convert plain strings to objects
+    if "ambiguities" in data and isinstance(data["ambiguities"], list):
+        fixed_ambiguities = []
+        for item in data["ambiguities"]:
+            if isinstance(item, str):
+                fixed_ambiguities.append({
+                    "description": item,
+                    "possible_interpretations": [],
+                    "source_text": "",
+                })
+            elif isinstance(item, dict):
+                fixed_ambiguities.append(item)
+        data["ambiguities"] = fixed_ambiguities
+
+    # Fix unsupported_requirements: convert plain strings to objects
+    if "unsupported_requirements" in data and isinstance(data["unsupported_requirements"], list):
+        fixed_unsupported = []
+        for item in data["unsupported_requirements"]:
+            if isinstance(item, str):
+                fixed_unsupported.append({
+                    "description": item,
+                    "reason": "",
+                    "source_text": "",
+                })
+            elif isinstance(item, dict):
+                fixed_unsupported.append(item)
+        data["unsupported_requirements"] = fixed_unsupported
+
+    # Fix constraints: convert plain strings to objects
+    if "constraints" in data and isinstance(data["constraints"], list):
+        fixed_constraints = []
+        for item in data["constraints"]:
+            if isinstance(item, str):
+                fixed_constraints.append({
+                    "constraint_type": "general",
+                    "description": item,
+                    "parameters": {},
+                })
+            elif isinstance(item, dict):
+                fixed_constraints.append(item)
+        data["constraints"] = fixed_constraints
+
+    # Fix tasks: ensure depends_on is always a list
+    if "tasks" in data and isinstance(data["tasks"], list):
+        for task in data["tasks"]:
+            if not isinstance(task, dict):
+                continue
+            # Fix depends_on if it's a string or malformed
+            deps = task.get("depends_on")
+            if isinstance(deps, str):
+                # Try to parse as JSON list
+                try:
+                    task["depends_on"] = json.loads(deps)
+                except (json.JSONDecodeError, TypeError):
+                    task["depends_on"] = [deps] if deps.strip() else []
+            elif deps is None:
+                task["depends_on"] = []
+
+            # Ensure confidence is a number
+            conf = task.get("confidence")
+            if isinstance(conf, str):
+                try:
+                    task["confidence"] = float(conf)
+                except (TypeError, ValueError):
+                    task["confidence"] = None
+
+    return data
 
 
 async def extract_semantic_intent(
@@ -361,5 +358,58 @@ def _call_groq_json_sync(messages: list[dict[str, str]]) -> dict[str, Any]:
                     logger.info("Rate limited, retrying in %ds (attempt %d/%d)", wait_time, attempt + 1, max_retries)
                     time.sleep(wait_time)
                     continue
+            # Groq sometimes rejects valid-ish JSON via json_validate_failed
+            # but includes the generated output — try to salvage it
+            if "failed_generation" in error_str:
+                salvaged = _try_salvage_failed_generation(e)
+                if salvaged is not None:
+                    return salvaged
             logger.error("Groq semantic extraction failed: %s", e)
             raise ValueError(f"LLM extraction call failed: {e}") from e
+
+
+def _try_salvage_failed_generation(exc: Exception) -> dict[str, Any] | None:
+    """Try to extract usable JSON from Groq's failed_generation error.
+
+    When Groq's JSON mode rejects output due to minor formatting issues,
+    the actual generated text is included in the error. We attempt to parse
+    it and fix common issues.
+    """
+    import re
+    error_str = str(exc)
+
+    # Extract the failed_generation JSON from the error message
+    match = re.search(r"'failed_generation':\s*'(.*?)'}\s*$", error_str, re.DOTALL)
+    if not match:
+        # Try alternate format
+        match = re.search(r'"failed_generation":\s*"(.*?)"\s*}', error_str, re.DOTALL)
+    if not match:
+        return None
+
+    raw_json = match.group(1)
+    # Unescape
+    raw_json = raw_json.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+
+    try:
+        data = json.loads(raw_json)
+        if isinstance(data, dict):
+            logger.info("Salvaged failed_generation JSON successfully")
+            return _preprocess_llm_output(data)
+    except json.JSONDecodeError:
+        pass
+
+    # Try fixing common issues: depends_on as string
+    raw_json_fixed = re.sub(
+        r'"depends_on=\[([^\]]*)\]"',
+        lambda m: '"depends_on": [' + m.group(1) + ']',
+        raw_json,
+    )
+    try:
+        data = json.loads(raw_json_fixed)
+        if isinstance(data, dict):
+            logger.info("Salvaged failed_generation JSON after fixing depends_on")
+            return _preprocess_llm_output(data)
+    except json.JSONDecodeError:
+        pass
+
+    return None

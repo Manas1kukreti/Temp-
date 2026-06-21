@@ -211,11 +211,111 @@ def _semantic_column_match(
     user_term: str,
     source_columns: list[str],
 ) -> ColumnGroundingResult | None:
-    """Try semantic matching using known synonyms and abbreviations."""
+    """Try semantic matching using concept decomposition.
+
+    Instead of relying on an exact synonym list, this decomposes both the
+    user term and column names into semantic concepts and matches on overlap.
+    For example: "payment status" → concepts: {payment, status, transaction}
+    Column "transaction_status" → concepts: {transaction, status}
+    Overlap: {status, transaction} → match with high confidence.
+    """
     user_lower = user_term.strip().lower()
     user_normalized = _normalize_column_name(user_term)
 
-    # Known semantic synonym groups
+    # Concept expansion: map a word to all its semantic equivalents
+    _CONCEPT_MAP: dict[str, set[str]] = {
+        "consumer": {"consumer", "customer", "client", "user", "buyer", "borrower"},
+        "customer": {"consumer", "customer", "client", "user", "buyer", "borrower"},
+        "client": {"consumer", "customer", "client", "user", "buyer"},
+        "user": {"consumer", "customer", "client", "user"},
+        "payment": {"payment", "transaction", "transfer", "txn"},
+        "transaction": {"payment", "transaction", "transfer", "txn"},
+        "transfer": {"payment", "transaction", "transfer"},
+        "status": {"status", "state", "condition"},
+        "state": {"status", "state", "condition"},
+        "id": {"id", "identifier", "code", "number"},
+        "identifier": {"id", "identifier", "code"},
+        "name": {"name", "full name", "label", "title"},
+        "date": {"date", "time", "timestamp", "datetime", "created"},
+        "amount": {"amount", "value", "total", "sum", "price", "cost", "payment"},
+        "value": {"amount", "value", "total", "price", "cost"},
+        "gender": {"gender", "sex"},
+        "sex": {"gender", "sex"},
+        "email": {"email", "mail", "e mail"},
+        "phone": {"phone", "telephone", "mobile", "contact"},
+        "address": {"address", "street", "location", "postal"},
+        "income": {"income", "salary", "earnings", "revenue", "annual income"},
+        "salary": {"income", "salary", "earnings", "wage"},
+        "age": {"age", "years", "years old"},
+        "merchant": {"merchant", "vendor", "provider", "seller", "store", "shop"},
+        "vendor": {"merchant", "vendor", "provider", "seller"},
+        "education": {"education", "qualification", "degree", "school"},
+        "occupation": {"occupation", "job", "profession", "employment", "work"},
+        "marital": {"marital", "relationship", "married"},
+        "order": {"order", "transaction", "purchase", "invoice"},
+        "invoice": {"invoice", "order", "bill", "receipt"},
+        "credit": {"credit", "loan", "debt", "score"},
+        "debt": {"debt", "loan", "liability", "owed"},
+        "balance": {"balance", "remaining", "outstanding"},
+    }
+
+    def _expand_concepts(text: str) -> set[str]:
+        """Expand a normalized text into its full concept set."""
+        tokens = set(text.replace("_", " ").split())
+        expanded = set(tokens)
+        for token in tokens:
+            if token in _CONCEPT_MAP:
+                expanded |= _CONCEPT_MAP[token]
+        return expanded
+
+    user_concepts = _expand_concepts(user_normalized)
+
+    best_col: str | None = None
+    best_score: float = 0.0
+
+    for col in source_columns:
+        col_normalized = _normalize_column_name(col)
+        col_concepts = _expand_concepts(col_normalized)
+
+        # Compute concept overlap
+        overlap = user_concepts & col_concepts
+        if not overlap:
+            continue
+
+        # Score: overlap size relative to the smaller concept set
+        score = len(overlap) / min(len(user_concepts), len(col_concepts))
+
+        # Bonus: if the "core" word matches (the last meaningful token, usually the type)
+        user_tokens = user_normalized.split()
+        col_tokens = col_normalized.split()
+        if user_tokens and col_tokens and user_tokens[-1] == col_tokens[-1]:
+            score = min(score + 0.15, 1.0)
+
+        if score > best_score:
+            best_score = score
+            best_col = col
+
+    if best_col and best_score >= 0.6:
+        confidence = min(0.90, 0.70 + best_score * 0.25)
+        return ColumnGroundingResult(
+            user_term=user_term,
+            resolved_column=best_col,
+            confidence=confidence,
+            resolution_type="semantic_column_match",
+        )
+
+    # Fallback to the static synonym groups for edge cases
+    return _static_synonym_match(user_term, source_columns)
+
+
+def _static_synonym_match(
+    user_term: str,
+    source_columns: list[str],
+) -> ColumnGroundingResult | None:
+    """Fallback: static synonym group matching."""
+    user_lower = user_term.strip().lower()
+    user_normalized = _normalize_column_name(user_term)
+
     synonym_groups: list[set[str]] = [
         {"consumer id", "customer id", "client id", "user id", "consumer identifier", "customer identifier"},
         {"gender", "sex"},
@@ -226,7 +326,7 @@ def _semantic_column_match(
         {"address", "street address", "mailing address", "postal address"},
         {"date", "transaction date", "created date", "creation date"},
         {"amount", "value", "total", "payment", "price", "cost"},
-        {"status", "state", "payment status", "order status"},
+        {"status", "state", "payment status", "order status", "transaction status"},
         {"merchant", "vendor", "provider", "seller", "payment method"},
         {"transaction id", "txn id", "order id", "invoice id"},
         {"marital status", "relationship status"},
@@ -235,7 +335,6 @@ def _semantic_column_match(
         {"occupation", "job", "profession", "employment"},
     ]
 
-    # Check if user_term is in any synonym group
     user_group: set[str] | None = None
     for group in synonym_groups:
         if user_lower in group or user_normalized in group:
@@ -245,7 +344,6 @@ def _semantic_column_match(
     if user_group is None:
         return None
 
-    # Check if any source column matches the same group
     for col in source_columns:
         col_lower = col.strip().lower()
         col_normalized = _normalize_column_name(col)

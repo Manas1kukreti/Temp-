@@ -161,7 +161,13 @@ async def process_job_task(ctx, payload_dict: dict):
                 submission_id,
             )
         except Exception as exc:
+            # Extract user-friendly reason from canonical intent evidence if available
             reason = f"Canonical intent compilation failed: {exc}"
+            if payload.canonical_intent and payload.canonical_intent.intent:
+                intent_evidence = getattr(payload.canonical_intent.intent, 'evidence', [])
+                intent_status = getattr(payload.canonical_intent.intent, 'resolution_status', '')
+                if intent_status == "needs_clarification" and intent_evidence:
+                    reason = "; ".join(str(e) for e in intent_evidence)
             await repository.mark_quarantined(job_id, reason)
             result_payload = {
                 "submission_id": submission_id,
