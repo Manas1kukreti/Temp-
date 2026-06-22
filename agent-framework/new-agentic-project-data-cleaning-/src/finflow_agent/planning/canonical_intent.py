@@ -8,6 +8,8 @@ from typing import Any, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from finflow_agent.contract_registry import CanonicalOperator
+
 
 CANONICAL_INTENT_SCHEMA_VERSION = "2.0"
 CANONICAL_INTENT_ENVELOPE_VERSION = "1.0"
@@ -43,7 +45,7 @@ class FilterCondition(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     field: UnresolvedColumnReference
-    operator: Literal["eq", "neq", "gt", "lt", "gte", "lte", "contains"]
+    operator: CanonicalOperator
     value: Any
 
 

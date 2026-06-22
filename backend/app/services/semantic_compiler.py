@@ -320,16 +320,14 @@ def _compile_predicate(
             values = right.get("values", [])
             if not values and right.get("value") is not None:
                 values = [right["value"]]
-        # For canonical format, use multiple eq conditions with OR logic
-        # Or a single condition with list value
-        return [{"field": field, "operator": "eq", "value": values}]
+        return [{"field": field, "operator": "in", "value": values}]
 
     # Handle not_in
     if operator == RelationOperator.not_in.value:
         values = []
         if isinstance(right, dict):
             values = right.get("values", [])
-        return [{"field": field, "operator": "neq", "value": values}]
+        return [{"field": field, "operator": "not_in", "value": values}]
 
     # Handle is_null / is_not_null
     if operator == RelationOperator.is_null.value:

@@ -4254,6 +4254,21 @@ body {
   color: #fca5a5;
 }
 
+.ff-status--clarification {
+  background: rgba(168, 85, 247, 0.16);
+  color: #c4b5fd;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.ff-inline-action--clarification {
+  color: #c4b5fd;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 .ff-job-card__top {
   align-items: flex-start;
 }
@@ -6411,4 +6426,206 @@ select.auth-page-form__input option {
 
 .ff-submit-side .ff-panel {
   padding: 28px !important;
+}
+
+
+/* ====================== CLARIFICATION PANEL ====================== */
+.ff-clarification-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.ff-clarification-panel__header {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.ff-clarification-panel__header h3 {
+  color: var(--lf-ink);
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.ff-clarification-panel__meta {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.ff-clarification-panel__round {
+  background: var(--lf-wash);
+  border: 0.5px solid rgba(30, 130, 120, 0.18);
+  border-radius: 999px;
+  color: var(--lf-brand);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+}
+
+.ff-clarification-panel__timer {
+  color: var(--lf-muted);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.ff-clarification-panel__timer--expired {
+  color: var(--lf-danger);
+  font-weight: 700;
+}
+
+.ff-clarification-panel__alert {
+  background: #fcebeb;
+  border: 0.5px solid #efb9b9;
+  border-radius: 9px;
+  color: var(--lf-danger);
+  font-size: 13px;
+  padding: 10px 14px;
+}
+
+.ff-clarification-panel__alert--warning {
+  background: #faeeda;
+  border-color: #e6c98d;
+  color: #854f0b;
+}
+
+.ff-clarification-panel__questions {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ff-clarification-question {
+  background: var(--lf-surface);
+  border: 1px solid var(--lf-line);
+  border-radius: 12px;
+  padding: 16px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.ff-clarification-question--error {
+  border-color: var(--lf-danger);
+  box-shadow: 0 0 0 3px rgba(163, 58, 50, 0.1);
+}
+
+.ff-clarification-question__text {
+  color: var(--lf-ink);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  padding: 0;
+}
+
+.ff-clarification-question__options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ff-clarification-option {
+  align-items: center;
+  background: var(--lf-surface-soft);
+  border: 1px solid var(--lf-line);
+  border-radius: 9px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  padding: 10px 14px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.ff-clarification-option:hover {
+  background: var(--lf-wash);
+  border-color: rgba(30, 130, 120, 0.32);
+}
+
+.ff-clarification-option--selected {
+  background: var(--lf-wash);
+  border-color: var(--lf-brand-2);
+}
+
+.ff-clarification-option--none {
+  border-style: dashed;
+}
+
+.ff-clarification-option input[type="radio"] {
+  accent-color: var(--lf-brand);
+  height: 16px;
+  margin: 0;
+  width: 16px;
+}
+
+.ff-clarification-option__label {
+  color: var(--lf-ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ff-clarification-question__freetext {
+  margin-top: 10px;
+  padding-left: 26px;
+}
+
+.ff-clarification-question__freetext-input {
+  background: #fff;
+  border: 1px solid var(--lf-line);
+  border-radius: 8px;
+  color: var(--lf-ink);
+  font-size: 13px;
+  min-height: 38px;
+  padding: 8px 12px;
+  width: 100%;
+}
+
+.ff-clarification-question__freetext-input:disabled {
+  background: var(--lf-surface-soft);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.ff-clarification-question__error {
+  color: var(--lf-danger);
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 8px;
+  padding-left: 4px;
+}
+
+.ff-clarification-panel__actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  padding-top: 8px;
+}
+
+.ff-clarification-success,
+.ff-clarification-expired,
+.ff-clarification-refresh {
+  text-align: center;
+  padding: 20px;
+}
+
+.ff-clarification-success h3 {
+  color: var(--lf-brand);
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 6px;
+}
+
+.ff-clarification-expired h3 {
+  color: var(--lf-danger);
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 6px;
+}
+
+.ff-clarification-refresh h3 {
+  color: var(--lf-muted);
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 6px;
 }

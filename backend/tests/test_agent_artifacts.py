@@ -144,6 +144,7 @@ def test_submission_status_enum_contains_all_runtime_statuses():
         "awaiting_schema_approval",
         "awaiting_confirmation",
         "declined",
+        "awaiting_clarification",
     ]
 
 

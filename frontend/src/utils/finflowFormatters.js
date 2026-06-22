@@ -7,6 +7,7 @@ export function formatJobStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (normalized === "quarantined") return "Quarantined";
   if (normalized === "schema_review") return "Schema review";
+  if (normalized === "clarification") return "Needs your input";
   if (normalized === "succeeded") return "Succeeded";
   if (normalized === "callback_failed") return "Callback failed";
   if (normalized === "declined") return "Declined";

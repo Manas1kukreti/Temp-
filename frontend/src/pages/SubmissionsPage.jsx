@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { FiDownload, FiRefreshCw, FiSearch } from "react-icons/fi";
+import { FiAlertCircle, FiDownload, FiRefreshCw, FiSearch } from "react-icons/fi";
 import { downloadJobOutput, fetchJobs, retryJob } from "../api/finflow.js";
 import { useLiveJobRefresh } from "../hooks/useLiveJobRefresh.js";
 import {
@@ -93,6 +93,7 @@ export default function SubmissionsPage() {
             >
               <option value="all">All statuses</option>
               <option value="running">Running</option>
+              <option value="clarification">Needs input</option>
               <option value="quarantined">Quarantined</option>
               <option value="complete">Complete</option>
               <option value="failed">Failed</option>
@@ -108,9 +109,16 @@ export default function SubmissionsPage() {
                   <div className="ff-job-card__id">{job.id}</div>
                   <h3>{job.title}</h3>
                 </div>
-                <span className={`ff-status ff-status--${job.status}`}>
-                  {formatJobStatus(job.status)}
-                </span>
+                {job.status === "clarification" ? (
+                  <span className="ff-status ff-status--clarification" aria-label="Needs your input">
+                    <FiAlertCircle size={14} aria-hidden="true" />
+                    Needs your input
+                  </span>
+                ) : (
+                  <span className={`ff-status ff-status--${job.status}`}>
+                    {formatJobStatus(job.status)}
+                  </span>
+                )}
               </div>
               <p>{summarizeInstruction(job.instruction)}</p>
               {job.jobSummary ? (
@@ -160,6 +168,11 @@ export default function SubmissionsPage() {
                     <FiRefreshCw size={14} />
                     {retryMutation.isPending ? "Requeueing..." : "Retry job"}
                   </button>
+                ) : job.status === "clarification" ? (
+                  <Link to={`/jobs/${job.backendId}`} className="ff-inline-action ff-inline-action--clarification">
+                    <FiAlertCircle size={14} />
+                    Resolve ambiguities
+                  </Link>
                 ) : job.status === "quarantined" ? (
                   <span className="ff-copy-muted">
                     Quarantined for review

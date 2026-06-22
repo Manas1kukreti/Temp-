@@ -2,11 +2,15 @@ import { api } from "./client.js";
 
 export function mapWorkflowStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "awaiting_clarification") return "clarification";
   if (["pending", "queued", "planning", "running"].includes(normalized)) return "running";
   if (["awaiting_schema_approval", "awaiting_confirmation"].includes(normalized)) return "schema_review";
   if (normalized === "quarantined") return "quarantined";
   if (["succeeded", "complete"].includes(normalized)) return "complete";
   if (["failed", "callback_failed", "declined"].includes(normalized)) return "failed";
+  // Validation fallback: ensure "awaiting_clarification" is always caught
+  // even if normalization is bypassed or status arrives in unexpected format
+  if (String(status || "").includes("clarification")) return "clarification";
   return "running";
 }
 
@@ -64,6 +68,13 @@ function buildSummarySteps(status, workflowStatus) {
     return [
       { name: "Ingestion", status: "complete" },
       { name: "Schema approval", status: "blocked" },
+      { name: "Output", status: "blocked" },
+    ];
+  }
+  if (workflowStatus === "clarification") {
+    return [
+      { name: "Ingestion", status: "complete" },
+      { name: "Clarification", status: "blocked" },
       { name: "Output", status: "blocked" },
     ];
   }
@@ -262,6 +273,11 @@ export async function downloadJobOutput(jobId) {
 
 export async function retryJob(jobId) {
   const response = await api.post(`/uploads/${jobId}/retry`);
+  return response.data;
+}
+
+export async function fetchClarificationStatus(submissionId) {
+  const response = await api.get(`/uploads/${submissionId}/clarification-status`);
   return response.data;
 }
 

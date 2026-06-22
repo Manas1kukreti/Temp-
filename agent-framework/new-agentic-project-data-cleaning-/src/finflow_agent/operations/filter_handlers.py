@@ -76,5 +76,10 @@ FILTER_HANDLERS = {
     "in": filter_in,
     "not_in": filter_not_in,
     "is_null": filter_is_null,
-    "is_not_null": filter_is_not_null
+    "is_not_null": filter_is_not_null,
 }
+
+# Import-time coverage check: ensures every CanonicalOperator has a handler
+# and no unknown operators are registered. Raises ImportError on violation.
+from finflow_agent.contract_registry import check_operator_handler_coverage
+check_operator_handler_coverage(FILTER_HANDLERS)

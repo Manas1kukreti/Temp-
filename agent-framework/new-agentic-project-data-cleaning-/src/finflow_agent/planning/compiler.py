@@ -35,6 +35,15 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from finflow_agent.agents.visualization_agent import VISUALIZATION_DISABLED_MESSAGE
+from finflow_agent.contract_registry import (
+    validate_operator,
+    validate_action_kind,
+    resolve_semantic_operator,
+    resolve_semantic_operation_type,
+    InvalidOperatorError,
+    InvalidActionKindError,
+    UnmappedSemanticTypeError,
+)
 from finflow_agent.operations.schemas import (
     CleaningOperationPlan,
     DropDuplicatesOperation,
@@ -64,6 +73,16 @@ from finflow_agent.tools.config import get_enable_visualization
 # ---------------------------------------------------------------------------
 # Public types and constants
 # ---------------------------------------------------------------------------
+
+
+class SemanticCompilationError(Exception):
+    """Raised when the compiler detects a contract violation during compilation.
+
+    This error wraps contract-registry validation failures (invalid operators
+    or invalid action kinds) so downstream consumers of the compiler have a
+    single exception type to catch for all compilation failures. The message
+    includes the invalid value and valid options for fast debugging.
+    """
 
 
 class VisualizationDisabledError(Exception):
@@ -111,6 +130,51 @@ SAFE_FILTER_PREP_OPERATIONS: List[str] = [
     "safe_date_detection",
     "categorical_value_normalization",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Contract validation wrappers
+# ---------------------------------------------------------------------------
+
+
+def _validated_operator(operator: str) -> str:
+    """Validate operator against contract registry, raise SemanticCompilationError on failure."""
+    try:
+        return validate_operator(operator).value
+    except InvalidOperatorError as e:
+        raise SemanticCompilationError(str(e)) from e
+
+
+def _validated_action_kind(kind: str) -> str:
+    """Validate action kind against contract registry, raise SemanticCompilationError on failure."""
+    try:
+        return validate_action_kind(kind).value
+    except InvalidActionKindError as e:
+        raise SemanticCompilationError(str(e)) from e
+
+
+def _resolved_semantic_operator(relation_operator: str) -> str:
+    """Resolve a semantic relation operator to its canonical operator via the contract registry.
+
+    Wraps UnmappedSemanticTypeError as SemanticCompilationError so callers
+    see a single exception type for all compilation failures.
+    """
+    try:
+        return resolve_semantic_operator(relation_operator).value
+    except UnmappedSemanticTypeError as e:
+        raise SemanticCompilationError(str(e)) from e
+
+
+def _resolved_semantic_operation_type(operation_type: str) -> str:
+    """Resolve a semantic operation type to its canonical action kind via the contract registry.
+
+    Wraps UnmappedSemanticTypeError as SemanticCompilationError so callers
+    see a single exception type for all compilation failures.
+    """
+    try:
+        return resolve_semantic_operation_type(operation_type).value
+    except UnmappedSemanticTypeError as e:
+        raise SemanticCompilationError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +556,11 @@ def _canonical_intent_to_plan_intent(
     drop_columns_seen = False
 
     for action in intent.actions:
+        # Resolve the semantic operation type to a canonical action kind via
+        # the contract registry.  This ensures the compiler uses the single
+        # source-of-truth mapping (Requirements 5.2, 6.1, 7.4).
+        _resolved_semantic_operation_type(action.kind)
+
         if isinstance(action, CleanIntent):
             cleaning_plan = _build_cleaning_plan(action)
             needs_cleaning = True
@@ -640,7 +709,7 @@ def _canonical_filter_conditions(
         return [
             FilterCondition(
                 column=_resolve_single_grounded_column(condition.field),
-                operator=condition.operator,
+                operator=_resolved_semantic_operator(condition.operator),
                 value=condition.value,
             )
             for condition in conditions
@@ -652,7 +721,7 @@ def _canonical_filter_conditions(
         inverted.append(
             FilterCondition(
                 column=_resolve_single_grounded_column(condition.field),
-                operator=operator,
+                operator=_resolved_semantic_operator(operator),
                 value=condition.value,
             )
         )
@@ -687,10 +756,319 @@ def _invert_operator(operator: str) -> str:
 
 
 __all__ = [
+    "SemanticCompilationError",
     "VisualizationDisabledError",
     "VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE",
     "CANONICAL_OUTPUT_KEYS",
     "SAFE_FILTER_PREP_OPERATIONS",
     "build_reporting_params",
     "compile_intent_to_plan",
+    # --- New refactored pipeline exports (Semantic Grounding Refactor) ---
+    "CompilerError",
+    "ExecutionStep",
+    "RefactoredExecutionPlan",
+    "Compiler",
 ]
+
+
+# ===========================================================================
+# NEW: Refactored Compiler (Semantic Grounding Refactor)
+#
+# This section implements the deterministic Compiler contract from the
+# semantic-grounding-refactor spec. It accepts only the new CanonicalIntent
+# model (from models/canonical.py), validates all column references are
+# resolved (type-level guarantee), and produces an ExecutionPlan.
+#
+# Requirements: 6.1, 6.4, 11.1, 11.2
+# ===========================================================================
+
+from enum import Enum
+from typing import Literal as TypingLiteral
+from uuid import uuid4 as _uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from finflow_agent.models.canonical import (
+    CanonicalIntent as RefactoredCanonicalIntent,
+    ResolvedAction,
+    ResolvedFilterAction,
+    ResolvedProjectAction,
+    ResolvedDropAction,
+    ResolvedSortAction,
+    ResolvedRenameAction,
+)
+
+
+class CompilerError(Exception):
+    """Raised when the Compiler detects a contract violation.
+
+    This covers:
+    - Input that is not a CanonicalIntent
+    - Column references that are not resolved to physical columns
+    - Any attempt to perform grounding or semantic re-interpretation
+
+    Requirements: 11.1, 11.2
+    """
+
+    pass
+
+
+class ActionType(str, Enum):
+    """Enumeration of execution step action types."""
+
+    FILTER = "filter"
+    PROJECT = "project"
+    DROP = "drop"
+    SORT = "sort"
+    RENAME = "rename"
+
+
+class ExecutionStep(BaseModel):
+    """A single execution step in the execution plan.
+
+    Each step represents one resolved action that the Executor will perform.
+    All column references are physical (resolved) column names.
+
+    Requirements: 11.1 - every column reference validated as physical.
+    """
+
+    model_config = ConfigDict(strict=True, frozen=True)
+
+    step_id: str = Field(default_factory=lambda: str(_uuid4()))
+    action_type: ActionType
+    resolved_columns: List[str] = Field(
+        ...,
+        description="Physical column names involved in this step",
+    )
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Action-specific parameters (operators, values, directions, etc.)",
+    )
+
+
+class RefactoredExecutionPlan(BaseModel):
+    """An execution plan produced by the refactored Compiler.
+
+    Contains a list of ExecutionSteps plus intent metadata for traceability.
+    The Executor walks these steps sequentially — no LLM calls, no grounding,
+    no semantic interpretation.
+
+    Requirements: 6.1, 6.4, 11.1
+    """
+
+    model_config = ConfigDict(strict=True, frozen=True)
+
+    plan_id: str = Field(default_factory=lambda: str(_uuid4()))
+    intent_id: str = Field(
+        ..., description="ID of the CanonicalIntent that produced this plan"
+    )
+    source_draft_id: str = Field(
+        ..., description="ID of the original SemanticIntentDraft"
+    )
+    source_draft_revision: int = Field(
+        ..., description="Revision of the original draft"
+    )
+    schema_version: str = Field(
+        default="1.0", description="Plan schema version"
+    )
+    steps: List[ExecutionStep] = Field(
+        ..., description="Ordered list of execution steps"
+    )
+
+
+class Compiler:
+    """Deterministic compiler: CanonicalIntent → ExecutionPlan.
+
+    This compiler is the Decision_Owner for execution step selection.
+    It accepts only CanonicalIntent objects (from models/canonical.py),
+    which by type-level guarantee contain no unresolved active execution
+    references. It validates all column references are resolved to
+    physical columns and produces an ExecutionPlan.
+
+    Contract:
+    - Accepts ONLY CanonicalIntent (type-level guarantee, Req 11.2)
+    - Validates every column reference resolved to physical column (Req 11.1)
+    - Does NOT perform grounding (Req 6.4)
+    - Does NOT make LLM calls (Req 6.4)
+    - Does NOT re-interpret semantics (Req 6.4)
+    - Produces a RefactoredExecutionPlan
+
+    Requirements: 6.1, 6.4, 11.1, 11.2
+    """
+
+    def compile(self, intent: RefactoredCanonicalIntent) -> RefactoredExecutionPlan:
+        """Compile a canonical intent into an execution plan.
+
+        Preconditions (type-level guarantees):
+        - Input is CanonicalIntent (always resolved)
+        - Every column reference resolved to physical column
+
+        Does NOT: perform grounding, make LLM calls, re-interpret semantics.
+
+        Args:
+            intent: A fully-resolved CanonicalIntent.
+
+        Returns:
+            A RefactoredExecutionPlan with ordered ExecutionSteps.
+
+        Raises:
+            CompilerError: If the input is not a CanonicalIntent or any
+                column reference is not resolved.
+        """
+        # Type-level contract enforcement (Req 11.2)
+        if not isinstance(intent, RefactoredCanonicalIntent):
+            raise CompilerError(
+                f"Compiler accepts only CanonicalIntent objects. "
+                f"Received: {type(intent).__name__}"
+            )
+
+        # Validate resolution_status (redundant due to type literal, but
+        # belt-and-suspenders for contract enforcement)
+        if intent.resolution_status != "resolved":
+            raise CompilerError(
+                f"CanonicalIntent must have resolution_status='resolved'. "
+                f"Got: {intent.resolution_status!r}"
+            )
+
+        # Validate actions are present
+        if not intent.actions:
+            raise CompilerError(
+                "CanonicalIntent contains no actions to compile."
+            )
+
+        # Walk resolved actions and compile to execution steps
+        steps: List[ExecutionStep] = []
+        for action in intent.actions:
+            step = self._compile_action(action)
+            steps.append(step)
+
+        return RefactoredExecutionPlan(
+            intent_id=intent.intent_id,
+            source_draft_id=intent.source_draft_id,
+            source_draft_revision=intent.source_draft_revision,
+            steps=steps,
+        )
+
+    def _compile_action(self, action: ResolvedAction) -> ExecutionStep:
+        """Compile a single resolved action into an ExecutionStep.
+
+        Validates that all column references within the action are resolved
+        to physical column names (non-empty strings).
+
+        Raises CompilerError if any column reference is invalid.
+        """
+        if isinstance(action, ResolvedFilterAction):
+            return self._compile_filter(action)
+        elif isinstance(action, ResolvedProjectAction):
+            return self._compile_project(action)
+        elif isinstance(action, ResolvedDropAction):
+            return self._compile_drop(action)
+        elif isinstance(action, ResolvedSortAction):
+            return self._compile_sort(action)
+        elif isinstance(action, ResolvedRenameAction):
+            return self._compile_rename(action)
+        else:
+            raise CompilerError(
+                f"Unknown resolved action type: {type(action).__name__}"
+            )
+
+    def _compile_filter(self, action: ResolvedFilterAction) -> ExecutionStep:
+        """Compile a resolved filter action into an ExecutionStep."""
+        columns: List[str] = []
+        for predicate in action.predicates:
+            col = predicate.get("column")
+            if not col or not isinstance(col, str) or not col.strip():
+                raise CompilerError(
+                    f"Filter predicate has unresolved or empty column reference: "
+                    f"{predicate!r}"
+                )
+            columns.append(str(col))
+
+        self._validate_columns_resolved(columns, "filter")
+
+        return ExecutionStep(
+            action_type=ActionType.FILTER,
+            resolved_columns=columns,
+            params={"predicates": [dict(p) for p in action.predicates]},
+        )
+
+    def _compile_project(self, action: ResolvedProjectAction) -> ExecutionStep:
+        """Compile a resolved project action into an ExecutionStep."""
+        self._validate_columns_resolved(action.columns, "project")
+
+        return ExecutionStep(
+            action_type=ActionType.PROJECT,
+            resolved_columns=list(action.columns),
+            params={},
+        )
+
+    def _compile_drop(self, action: ResolvedDropAction) -> ExecutionStep:
+        """Compile a resolved drop action into an ExecutionStep."""
+        self._validate_columns_resolved(action.columns, "drop")
+
+        return ExecutionStep(
+            action_type=ActionType.DROP,
+            resolved_columns=list(action.columns),
+            params={},
+        )
+
+    def _compile_sort(self, action: ResolvedSortAction) -> ExecutionStep:
+        """Compile a resolved sort action into an ExecutionStep."""
+        self._validate_columns_resolved(action.keys, "sort")
+
+        if len(action.keys) != len(action.directions):
+            raise CompilerError(
+                f"Sort action has mismatched keys ({len(action.keys)}) "
+                f"and directions ({len(action.directions)})."
+            )
+
+        return ExecutionStep(
+            action_type=ActionType.SORT,
+            resolved_columns=list(action.keys),
+            params={"directions": list(action.directions)},
+        )
+
+    def _compile_rename(self, action: ResolvedRenameAction) -> ExecutionStep:
+        """Compile a resolved rename action into an ExecutionStep."""
+        source_columns: List[str] = []
+        rename_map: Dict[str, str] = {}
+
+        for source_col, new_name in action.mappings:
+            if not source_col or not source_col.strip():
+                raise CompilerError(
+                    f"Rename action has unresolved source column: "
+                    f"'{source_col}' -> '{new_name}'"
+                )
+            if not new_name or not new_name.strip():
+                raise CompilerError(
+                    f"Rename action has empty target name for column: "
+                    f"'{source_col}'"
+                )
+            source_columns.append(source_col)
+            rename_map[source_col] = new_name
+
+        self._validate_columns_resolved(source_columns, "rename")
+
+        return ExecutionStep(
+            action_type=ActionType.RENAME,
+            resolved_columns=source_columns,
+            params={"rename_map": rename_map},
+        )
+
+    @staticmethod
+    def _validate_columns_resolved(
+        columns: List[str], context: str
+    ) -> None:
+        """Validate that all column names are non-empty resolved physical columns.
+
+        Raises CompilerError if any column is empty or whitespace-only.
+
+        Requirements: 11.1 - every column reference validated as physical.
+        """
+        for col in columns:
+            if not col or not col.strip():
+                raise CompilerError(
+                    f"Unresolved or empty column reference in {context} action: "
+                    f"'{col}'. All columns must be resolved to physical names "
+                    f"before compilation."
+                )

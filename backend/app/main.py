@@ -6,13 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from redis.asyncio import Redis
 
-from app.api import admin, agent, alerts, analytics, approvals, audit, auth, comments, uploads, websockets
+from app.api import admin, agent, alerts, analytics, approvals, audit, auth, clarification, comments, uploads, websockets
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.db.session import AsyncSessionLocal, get_db
 from app.models import User, UserRole
 from app.services.request_security import is_origin_allowed
 from app.services.agent_dispatcher import start_dispatcher, stop_dispatcher
+from app.services.clarification_expiration import start_cleanup_loop, stop_cleanup_loop
 from app.services.canonical_intent import (
     CANONICAL_INTENT_CAPABILITY_VERSION,
     CANONICAL_INTENT_SCHEMA_VERSION,
@@ -66,6 +67,7 @@ async def enforce_trusted_origin(request: Request, call_next):
     return await call_next(request)
 
 app.include_router(uploads.router, prefix="/api")
+app.include_router(clarification.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
 app.include_router(approvals.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
@@ -99,11 +101,13 @@ async def on_startup() -> None:
             if settings.environment.lower() == "development":
                 await ensure_demo_reporting_lines(db)
     await start_dispatcher(app)
+    await start_cleanup_loop(app)
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await stop_dispatcher(app)
+    await stop_cleanup_loop(app)
 
 
 async def seed_user(db, *, name: str, email: str, password: str, role: UserRole) -> None:

@@ -17,8 +17,10 @@ code validates, grounds, and compiles.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -125,10 +127,7 @@ def parse_llm_semantic_response(raw_json: str | dict[str, Any]) -> SemanticInten
     - depends_on as malformed strings → fix to proper lists
     """
     if isinstance(raw_json, str):
-        try:
-            data = json.loads(raw_json)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"LLM returned invalid JSON: {e}") from e
+        data = _load_json_like_payload(raw_json)
     else:
         data = raw_json
 
@@ -144,6 +143,202 @@ def parse_llm_semantic_response(raw_json: str | dict[str, Any]) -> SemanticInten
         raise ValueError(f"LLM response failed schema validation: {e}") from e
 
     return intent
+
+
+def _load_json_like_payload(raw_text: str) -> dict[str, Any]:
+    """Load a JSON-like payload with a small, safe recovery pipeline.
+
+    The recovery path is intentionally conservative:
+    1. parse strict JSON as-is
+    2. extract the first balanced JSON fragment from surrounding text
+    3. repair common model mistakes such as unquoted keys and trailing commas
+    4. try ``ast.literal_eval`` on a Python-literal variant
+    5. fall back to ``yaml.safe_load`` if PyYAML is available
+    """
+    candidates = _json_candidate_texts(raw_text)
+    last_error: Exception | None = None
+
+    for candidate in candidates:
+        for parser in (
+            json.loads,
+            _parse_literal_eval,
+            _parse_yaml_safe_load,
+        ):
+            try:
+                data = parser(candidate)
+            except Exception as exc:  # noqa: BLE001 - recovery path only
+                last_error = exc
+                continue
+
+            if isinstance(data, dict):
+                return data
+
+    raise ValueError(f"LLM returned invalid JSON after recovery attempts: {last_error}")
+
+
+def _json_candidate_texts(raw_text: str) -> list[str]:
+    """Generate increasingly permissive candidate payloads."""
+    text = _strip_code_fences(raw_text.strip())
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str | None) -> None:
+        if not candidate:
+            return
+        normalized = candidate.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(normalized)
+
+    add(text)
+    add(_extract_balanced_json_fragment(text))
+    repaired = _repair_json_like_text(text)
+    add(repaired)
+    add(_extract_balanced_json_fragment(repaired))
+
+    return candidates
+
+
+def _strip_code_fences(text: str) -> str:
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def _extract_balanced_json_fragment(text: str) -> str | None:
+    """Return the first balanced JSON object/array fragment if one exists."""
+    start_index: int | None = None
+    opening_stack: list[str] = []
+    in_string = False
+    string_delimiter = ""
+    escaped = False
+
+    for index, char in enumerate(text):
+        if start_index is None:
+            if char in "{[":
+                start_index = index
+                opening_stack = [char]
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == string_delimiter:
+                in_string = False
+            continue
+
+        if char in "\"'":
+            in_string = True
+            string_delimiter = char
+            continue
+
+        if char in "{[":
+            opening_stack.append(char)
+            continue
+
+        if char in "}]":
+            if not opening_stack:
+                return None
+            opening = opening_stack.pop()
+            if (opening == "{" and char != "}") or (opening == "[" and char != "]"):
+                return None
+            if not opening_stack and start_index is not None:
+                return text[start_index : index + 1]
+
+    return None
+
+
+def _repair_json_like_text(text: str) -> str:
+    """Apply targeted repairs for common LLM JSON mistakes."""
+    repaired = text
+
+    # Remove trailing commas before closing braces/brackets.
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+    # Fix broken quoted keys like "depends_on:[ ... -> "depends_on": [ ...
+    repaired = re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_\-]*)\s*:\s*',
+        lambda match: f'"{match.group(1)}": ',
+        repaired,
+    )
+
+    # Quote bare keys in object positions, e.g. depends_on:[...] -> "depends_on":[...]
+    repaired = re.sub(
+        r"([{\[,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)\s*:",
+        r'\1"\2":',
+        repaired,
+    )
+
+    # Handle single-quoted keys in object positions.
+    repaired = re.sub(
+        r"([{\[,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'\s*:",
+        lambda match: f'{match.group(1)}"{match.group(2)}":',
+        repaired,
+    )
+
+    # If values were single-quoted, convert them to double-quoted strings.
+    repaired = re.sub(
+        r":\s*'([^'\\]*(?:\\.[^'\\]*)*)'",
+        lambda match: ': "' + match.group(1).replace('"', '\\"') + '"',
+        repaired,
+    )
+
+    # Balance obviously unclosed brackets/braces at the end of the payload.
+    repaired = _close_unbalanced_delimiters(repaired)
+
+    return repaired
+
+
+def _close_unbalanced_delimiters(text: str) -> str:
+    """Append closing delimiters for any obvious unbalanced opening tokens."""
+    opens: list[str] = []
+    in_string = False
+    string_delimiter = ""
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == string_delimiter:
+                in_string = False
+            continue
+
+        if char in "\"'":
+            in_string = True
+            string_delimiter = char
+            continue
+
+        if char in "{[":
+            opens.append(char)
+        elif char in "}]":
+            if opens:
+                opens.pop()
+
+    closing = "".join("}" if char == "{" else "]" for char in reversed(opens))
+    return text + closing
+
+
+def _parse_literal_eval(text: str) -> Any:
+    """Parse a Python-literal variant of the payload."""
+    python_like = re.sub(r"\bnull\b", "None", text)
+    python_like = re.sub(r"\btrue\b", "True", python_like, flags=re.IGNORECASE)
+    python_like = re.sub(r"\bfalse\b", "False", python_like, flags=re.IGNORECASE)
+    return ast.literal_eval(python_like)
+
+
+def _parse_yaml_safe_load(text: str) -> Any:
+    """Parse the payload via YAML as a last resort if PyYAML is installed."""
+    try:
+        import yaml
+    except Exception as exc:  # noqa: BLE001 - optional dependency fallback
+        raise RuntimeError("PyYAML is not available") from exc
+
+    return yaml.safe_load(text)
 
 
 def _preprocess_llm_output(data: dict[str, Any]) -> dict[str, Any]:
@@ -198,11 +393,9 @@ def _preprocess_llm_output(data: dict[str, Any]) -> dict[str, Any]:
             # Fix depends_on if it's a string or malformed
             deps = task.get("depends_on")
             if isinstance(deps, str):
-                # Try to parse as JSON list
-                try:
-                    task["depends_on"] = json.loads(deps)
-                except (json.JSONDecodeError, TypeError):
-                    task["depends_on"] = [deps] if deps.strip() else []
+                task["depends_on"] = _normalize_depends_on_value(deps)
+            elif isinstance(deps, list):
+                task["depends_on"] = _normalize_depends_on_value(deps)
             elif deps is None:
                 task["depends_on"] = []
 
@@ -215,6 +408,50 @@ def _preprocess_llm_output(data: dict[str, Any]) -> dict[str, Any]:
                     task["confidence"] = None
 
     return data
+
+
+def _normalize_depends_on_value(deps: str | list[Any]) -> list[str]:
+    """Normalize a depends_on payload into a clean list of task IDs."""
+    values: list[Any]
+    if isinstance(deps, str):
+        stripped = deps.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            values = [stripped]
+        else:
+            if isinstance(parsed, list):
+                values = parsed
+            elif isinstance(parsed, str):
+                values = [parsed]
+            else:
+                values = [parsed]
+    else:
+        values = list(deps)
+
+    normalized: list[str] = []
+    for item in values:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            cleaned = (
+                item.replace("\\n", " ")
+                .replace("\\r", " ")
+                .replace("\\t", " ")
+                .replace('\\"', '"')
+                .replace("\\'", "'")
+            )
+            cleaned = cleaned.strip().strip('"').strip("'").strip()
+            if cleaned:
+                normalized.append(cleaned)
+        else:
+            cleaned = str(item).strip()
+            if cleaned:
+                normalized.append(cleaned)
+
+    return normalized
 
 
 async def extract_semantic_intent(
@@ -389,27 +626,10 @@ def _try_salvage_failed_generation(exc: Exception) -> dict[str, Any] | None:
     raw_json = match.group(1)
     # Unescape
     raw_json = raw_json.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
-
     try:
-        data = json.loads(raw_json)
-        if isinstance(data, dict):
-            logger.info("Salvaged failed_generation JSON successfully")
-            return _preprocess_llm_output(data)
-    except json.JSONDecodeError:
-        pass
+        data = _load_json_like_payload(raw_json)
+    except ValueError:
+        return None
 
-    # Try fixing common issues: depends_on as string
-    raw_json_fixed = re.sub(
-        r'"depends_on=\[([^\]]*)\]"',
-        lambda m: '"depends_on": [' + m.group(1) + ']',
-        raw_json,
-    )
-    try:
-        data = json.loads(raw_json_fixed)
-        if isinstance(data, dict):
-            logger.info("Salvaged failed_generation JSON after fixing depends_on")
-            return _preprocess_llm_output(data)
-    except json.JSONDecodeError:
-        pass
-
-    return None
+    logger.info("Salvaged failed_generation JSON successfully")
+    return _preprocess_llm_output(data)

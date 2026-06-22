@@ -52,6 +52,7 @@ services:
       - "8000:8000"
     volumes:
       - backend_storage:/app/storage
+      - ./agent-framework/new-agentic-project-data-cleaning-/src:/app/finflow_agent_src
     depends_on:
       postgres:
         condition: service_healthy

@@ -3,15 +3,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiCheck, FiChevronDown, FiDownload, FiRefreshCw, FiX } from "react-icons/fi";
 import { useParams } from "react-router-dom";
 import DataTable from "../components/DataTable.jsx";
+import ClarificationPanel from "../components/ClarificationPanel.jsx";
 import {
   approveSchemaProposal,
   declineSchemaProposal,
   downloadJobOutput,
+  fetchClarificationStatus,
   fetchJobDetail,
   retryJob,
   confirmExtraction,
 } from "../api/finflow.js";
 import { useLiveJobRefresh } from "../hooks/useLiveJobRefresh.js";
+import { useClarificationSocket } from "../hooks/useClarificationSocket.js";
 import {
   formatDateTime,
   formatJobStatus,
@@ -32,6 +35,44 @@ export default function AuditPage() {
     enabled: Boolean(jobId),
   });
   useLiveJobRefresh(jobId);
+
+  // Clarification WebSocket integration
+  const {
+    session: clarificationSession,
+    isActive: clarificationActive,
+    isResolved: clarificationResolved,
+    isExpired: clarificationExpired,
+    refreshSession: refreshClarificationSession,
+    dismiss: dismissClarification,
+  } = useClarificationSocket(jobId);
+
+  // REST fallback: fetch clarification session state on page load when job is
+  // already in "awaiting_clarification" status but WebSocket hasn't delivered the event yet
+  const showClarificationFromStatus = job?.status === "clarification" && !clarificationActive;
+  const { data: restClarificationSession } = useQuery({
+    queryKey: ["clarification-status", jobId],
+    queryFn: () => fetchClarificationStatus(jobId),
+    enabled: Boolean(jobId) && showClarificationFromStatus,
+    retry: 1,
+    staleTime: 30000,
+  });
+
+  // Determine the active clarification data: prefer WebSocket, fallback to REST
+  const activeClarificationData = clarificationActive
+    ? clarificationSession
+    : showClarificationFromStatus && restClarificationSession
+      ? {
+          sessionId: restClarificationSession.session_id,
+          submissionId: restClarificationSession.submission_id || jobId,
+          questions: restClarificationSession.questions || [],
+          roundCount: restClarificationSession.round_count ?? 0,
+          maxRounds: restClarificationSession.max_rounds ?? 2,
+          expiresAt: restClarificationSession.expires_at,
+          revisionToken: restClarificationSession.revision_token,
+          intentVersion: restClarificationSession.intent_version,
+        }
+      : null;
+  const shouldShowClarificationPanel = clarificationActive || Boolean(activeClarificationData);
 
   const retryMutation = useMutation({
     mutationFn: retryJob,
@@ -211,6 +252,49 @@ export default function AuditPage() {
             <strong>{formatDateTime(job.completedAt)}</strong>
           </div>
         </div>
+
+        {/* Clarification Panel — rendered when WebSocket delivers clarification events or status is awaiting_clarification */}
+        {shouldShowClarificationPanel && activeClarificationData && (
+          <ClarificationPanel
+            submissionId={activeClarificationData.submissionId}
+            sessionId={activeClarificationData.sessionId}
+            questions={activeClarificationData.questions}
+            roundCount={activeClarificationData.roundCount}
+            maxRounds={activeClarificationData.maxRounds}
+            expiresAt={activeClarificationData.expiresAt}
+            revisionToken={activeClarificationData.revisionToken}
+            intentVersion={activeClarificationData.intentVersion}
+            onResolved={() => {
+              dismissClarification();
+              queryClient.invalidateQueries({ queryKey: ["jobs", "detail", jobId] });
+              queryClient.invalidateQueries({ queryKey: ["clarification-status", jobId] });
+            }}
+            onSessionExpired={() => {
+              dismissClarification();
+              queryClient.invalidateQueries({ queryKey: ["jobs", "detail", jobId] });
+              queryClient.invalidateQueries({ queryKey: ["clarification-status", jobId] });
+            }}
+            onSessionRefresh={refreshClarificationSession}
+          />
+        )}
+        {clarificationResolved && (
+          <section className="ff-panel ff-panel--dense" aria-live="polite" aria-label="Clarification resolved">
+            <div className="ff-clarification-success">
+              <h3>Ambiguities resolved</h3>
+              <p className="ff-copy-muted">Your answers have been applied. The job is now running.</p>
+            </div>
+          </section>
+        )}
+        {clarificationExpired && (
+          <section className="ff-panel ff-panel--dense" aria-live="polite" aria-label="Session expired">
+            <div className="ff-clarification-expired">
+              <h3>Session expired</h3>
+              <p className="ff-copy-muted">
+                The clarification session has expired. This job has been moved to quarantine.
+              </p>
+            </div>
+          </section>
+        )}
         <section className="ff-panel ff-panel--dense">
           <div className="ff-panel__head">
             <div>

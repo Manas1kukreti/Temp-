@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
 from app.services.canonical_intent import build_canonical_intent
+from app.services.new_pipeline_bridge import run_new_semantic_pipeline_sync
 from app.services.rule_engine import build_validation_warnings
 from app.services.schema_proposal import build_schema_proposal_from_file
+from app.services.new_pipeline_bridge import _convert_filter
 
 
 def test_forbidden_substring_flags_normalized_variants():
@@ -140,3 +143,127 @@ def test_schema_proposal_includes_canonical_intent(monkeypatch):
     assert proposal["original_prompt"] == "return only customer id and name"
     assert proposal["canonical_intent"]["actions"][0]["kind"] == "project_columns"
     assert proposal["action_schema"]["actions"][0]["action"] == "keep_columns"
+
+
+def test_bridge_semantic_result_repairs_generic_filter_reference_from_preview(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_BRIDGE_API_KEY", "test-bridge-key")
+
+    unresolved_bridge_result = {
+        "schema_version": "2.0",
+        "intent_id": "intent-1",
+        "intent_revision": 1,
+        "intent_hash": "hash-1",
+        "parent_intent_id": None,
+        "original_prompt": "Clean the data and extract rows which contains paypal or cash as field",
+        "normalized_prompt": "clean the data and extract rows which contains paypal or cash as field",
+        "resolution_status": "needs_clarification",
+        "decision": "filter rows (1 condition(s))",
+        "evidence": ["new_pipeline_extraction: 1.0"],
+        "alternatives_considered": [],
+        "actions": [
+            {
+                "kind": "filter_rows",
+                "mode": "keep",
+                "conditions": [
+                    {
+                        "field": {
+                            "raw_reference": "field",
+                            "resolved_column": None,
+                            "resolution_method": "generic_reference",
+                            "candidate_columns": [],
+                            "evidence": [],
+                            "resolved_columns": [],
+                        },
+                        "operator": "contains",
+                        "value": ["paypal", "cash"],
+                    }
+                ],
+                "logic": "and",
+            }
+        ],
+        "output_format": "xlsx",
+        "assumptions": [],
+        "repair_notes": [],
+        "dataframe_profile": {"columns": ["transaction_id", "payment_method", "transaction_status"]},
+        "capability_version": "backend.capability.1",
+        "capability_snapshot": {},
+    }
+
+    def _fake_bridge(*args, **kwargs):
+        return unresolved_bridge_result
+
+    monkeypatch.setattr("app.services.new_pipeline_bridge.run_new_semantic_pipeline_sync", _fake_bridge)
+
+    preview_rows = [
+        {
+            "transaction_id": "T0001",
+            "payment_method": "pay pal",
+            "transaction_status": "Pending",
+        },
+        {
+            "transaction_id": "T0002",
+            "payment_method": "credit card",
+            "transaction_status": "Completed",
+        },
+    ]
+
+    result = build_canonical_intent(
+        ["transaction_id", "payment_method", "transaction_status"],
+        preview_rows,
+        "Clean the data and extract rows which contains paypal or cash as field",
+        detected_types={
+            "transaction_id": "string",
+            "payment_method": "string",
+            "transaction_status": "string",
+        },
+    )
+
+    condition = result["actions"][0]["conditions"][0]
+    assert condition["field"]["resolved_column"] == "payment_method"
+    assert condition["field"]["resolution_method"] == "profile_semantic_match"
+    assert result["resolution_status"] == "repaired"
+
+
+def test_new_pipeline_bridge_expands_in_membership_without_stringifying():
+    field_ref = SimpleNamespace(
+        reference_text="payment method",
+        resolved_column="payment_method",
+        reference_kind=SimpleNamespace(value="semantic_concept"),
+    )
+    predicate = SimpleNamespace(
+        field_ref=field_ref,
+        operator="in",
+        value=["paypal", "cash"],
+    )
+    group = SimpleNamespace(operator="and", predicates=[predicate])
+    action = SimpleNamespace(logical_groups=[group])
+
+    converted = _convert_filter(action)
+
+    assert converted["logic"] == "or"
+    assert [cond["value"] for cond in converted["conditions"]] == ["paypal", "cash"]
+    assert all(cond["operator"] == "contains" for cond in converted["conditions"])
+
+
+def test_new_pipeline_bridge_returns_none_on_rate_limit(monkeypatch):
+    from finflow_agent.grounding.llm_adapter import LLMProviderError
+
+    monkeypatch.setenv("GROQ_BRIDGE_API_KEY", "bridge-key")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    def _boom(*args, **kwargs):
+        raise LLMProviderError(
+            "Groq API returned 429: rate limited",
+            error_type="rate_limit",
+            call_site="extraction",
+        )
+
+    monkeypatch.setattr("app.services.new_pipeline_bridge._run_pipeline", _boom)
+
+    result = run_new_semantic_pipeline_sync(
+        "Clean the data and extract rows which contains paypal or cash as field",
+        ["payment_method"],
+    )
+
+    assert result is None

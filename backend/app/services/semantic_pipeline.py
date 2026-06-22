@@ -16,6 +16,10 @@ The existing canonical intent system remains the final output format.
 This module REPLACES the primary understanding mechanism (regex) with
 semantic LLM extraction while keeping deterministic logic as fast-path
 and validation.
+
+Additionally, this module provides `run_semantic_pipeline_with_clarification()`
+which integrates with the ClarificationService to route resolvable ambiguities
+to interactive clarification sessions rather than quarantine.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from app.services.semantic_models import (
     CoverageResult,
@@ -102,6 +107,10 @@ class SemanticExtractionResult:
     @property
     def needs_clarification(self) -> bool:
         return self.resolution_status == "needs_clarification"
+
+    @property
+    def awaiting_clarification(self) -> bool:
+        return self.resolution_status == "awaiting_clarification"
 
 
 async def run_semantic_pipeline(
@@ -365,3 +374,195 @@ def run_semantic_pipeline_sync(
         coverage_result=coverage,
         metadata=metadata,
     )
+
+
+# ---------------------------------------------------------------------------
+# Clarification-integrated pipeline
+# ---------------------------------------------------------------------------
+
+
+def _compute_ambiguity_score(result: SemanticExtractionResult) -> float:
+    """Compute an ambiguity score from the pipeline result.
+
+    The ambiguity score indicates how resolvable the ambiguity is:
+    - Higher scores (>= threshold) mean the ambiguity has good candidates
+      and is suitable for interactive clarification.
+    - Lower scores (< threshold) mean the ambiguity is too severe for
+      clarification and should go directly to quarantine.
+
+    Score computation:
+    - If grounded_intent exists with unresolved references that have candidates,
+      the score is the average of the best candidate confidence across unresolved refs.
+    - If no grounding info is available (e.g., extraction/coverage failure),
+      the score defaults to 0.0 (quarantine directly).
+    """
+    grounded = result.grounded_intent
+    if grounded is None:
+        # No grounding results — ambiguity is not resolvable via clarification
+        return 0.0
+
+    # Gather confidence scores from grounding results that need clarification
+    candidate_confidences: list[float] = []
+    for gr in grounded.grounding_results:
+        if gr.needs_clarification or gr.resolved_column is None:
+            # Use the confidence score (which represents best candidate match)
+            if gr.confidence > 0.0:
+                candidate_confidences.append(gr.confidence)
+            elif gr.candidates:
+                # Has candidates but no confidence scored — moderately resolvable
+                candidate_confidences.append(0.5)
+            else:
+                # No candidates at all — not resolvable
+                candidate_confidences.append(0.0)
+
+    if not candidate_confidences:
+        # No unresolved references found in grounding (shouldn't happen if
+        # resolution_status is needs_clarification, but handle gracefully)
+        return 0.0
+
+    return sum(candidate_confidences) / len(candidate_confidences)
+
+
+async def run_semantic_pipeline_with_clarification(
+    raw_prompt: str,
+    source_columns: list[str],
+    *,
+    submission_id: UUID,
+    db: Any,
+    column_types: dict[str, str] | None = None,
+    output_format: str = "xlsx",
+    llm_call: Any = None,
+    use_llm_coverage: bool = False,
+    intent: Any = None,
+    intent_package: Any = None,
+) -> SemanticExtractionResult:
+    """Run the semantic pipeline with clarification service integration.
+
+    This function wraps `run_semantic_pipeline` and adds interactive ambiguity
+    resolution routing. After the pipeline produces a "needs_clarification"
+    result, it:
+
+    1. Computes an ambiguity score from the grounding results.
+    2. Calls ClarificationService.initiate_session() with the score.
+    3. If a session is created (score >= threshold), halts further pipeline
+       processing and returns early with resolution_status="awaiting_clarification".
+    4. If no session is created (score < threshold), returns the original
+       "needs_clarification" result for existing quarantine logic to handle.
+
+    Parameters
+    ----------
+    raw_prompt : str
+        The raw user instruction.
+    source_columns : list[str]
+        Available columns in the dataset.
+    submission_id : UUID
+        The UUID of the submission being processed.
+    db : AsyncSession
+        SQLAlchemy async database session for ClarificationService.
+    column_types : dict | None
+        Optional column type mapping.
+    output_format : str
+        Desired output format.
+    llm_call : callable | None
+        Optional custom LLM callable for testing.
+    use_llm_coverage : bool
+        Whether to use LLM for coverage check.
+    intent : Any | None
+        Optional pre-existing CanonicalIntent (used if available).
+    intent_package : Any | None
+        Optional IntentPackage for schema resolution context.
+
+    Returns
+    -------
+    SemanticExtractionResult
+        The extraction result. If clarification was initiated, resolution_status
+        will be "awaiting_clarification" and pipeline processing is halted.
+
+    Requirements
+    -----------
+    1.1: Score >= threshold → session created + status "awaiting_clarification"
+    1.2: Score < threshold → quarantined without session (handled by caller)
+    """
+    # --- Run the base semantic pipeline ---
+    result = await run_semantic_pipeline(
+        raw_prompt,
+        source_columns,
+        column_types=column_types,
+        output_format=output_format,
+        llm_call=llm_call,
+        use_llm_coverage=use_llm_coverage,
+    )
+
+    # --- If pipeline resolved successfully, return as-is ---
+    if result.resolution_status != "needs_clarification":
+        return result
+
+    # --- Compute ambiguity score from grounding results ---
+    ambiguity_score = _compute_ambiguity_score(result)
+
+    # --- Attempt to initiate a clarification session ---
+    try:
+        from app.services.clarification_service import ClarificationService
+
+        service = ClarificationService(db)
+
+        # Use the provided intent/intent_package, or fall back to pipeline results
+        clarification_intent = intent or (
+            result.grounded_intent.intent.model_dump(mode="json")
+            if result.grounded_intent and result.grounded_intent.intent
+            else result.semantic_intent.model_dump(mode="json")
+            if result.semantic_intent
+            else {}
+        )
+        clarification_intent_package = intent_package or result.grounded_intent
+
+        session = await service.initiate_session(
+            submission_id=submission_id,
+            intent=clarification_intent,
+            intent_package=clarification_intent_package,
+            ambiguity_score=ambiguity_score,
+        )
+
+        if session is not None:
+            # Session created — halt further pipeline processing and return early
+            # The submission status has been transitioned to "awaiting_clarification"
+            # by ClarificationService.initiate_session()
+            logger.info(
+                "Clarification session %s created for submission %s (ambiguity_score=%.3f)",
+                session.id,
+                submission_id,
+                ambiguity_score,
+            )
+            return SemanticExtractionResult(
+                resolution_status="awaiting_clarification",
+                semantic_intent=result.semantic_intent,
+                grounded_intent=result.grounded_intent,
+                coverage_result=result.coverage_result,
+                repair_notes=result.repair_notes,
+                metadata=result.metadata,
+                evidence=[
+                    f"Clarification session initiated (score={ambiguity_score:.3f}). "
+                    f"Awaiting user input for {len(result.grounded_intent.unresolved_references) if result.grounded_intent else 0} "
+                    f"unresolved reference(s)."
+                ],
+            )
+
+        # Session NOT created — ambiguity_score below threshold.
+        # Return original result with needs_clarification for quarantine logic.
+        logger.info(
+            "Ambiguity score %.3f below threshold for submission %s; proceeding to quarantine.",
+            ambiguity_score,
+            submission_id,
+        )
+        return result
+
+    except Exception as e:
+        # Graceful degradation: if clarification service is unavailable,
+        # fall back to existing quarantine behavior (design spec requirement).
+        logger.warning(
+            "ClarificationService unavailable for submission %s: %s. "
+            "Falling back to quarantine.",
+            submission_id,
+            e,
+        )
+        return result

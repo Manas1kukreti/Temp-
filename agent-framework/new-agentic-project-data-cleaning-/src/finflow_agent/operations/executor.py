@@ -1,7 +1,7 @@
 import pandas as pd
 import time
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 
 from finflow_agent.state import ExecutionOutput
 from finflow_agent.operations.schemas import (
@@ -15,6 +15,7 @@ from finflow_agent.operations.calculation_handlers import CALCULATION_HANDLERS
 from finflow_agent.operations.visualization_handlers import VISUALIZATION_HANDLERS
 from finflow_agent.operations.reporting_handlers import REPORTING_HANDLERS
 from finflow_agent.operations.validators import required_columns_for_operation, validate_columns_exist, hash_operation_params
+from finflow_agent.contract_registry import check_action_kind_coverage
 
 def execute_cleaning_plan(df: pd.DataFrame, plan: CleaningOperationPlan) -> ExecutionOutput:
     output = ExecutionOutput(data=df.copy())
@@ -298,3 +299,85 @@ def execute_reporting_plan(df: pd.DataFrame, plan: ReportingOperationPlan, outpu
     
     output.summary = f"Successfully exported {plan.output_format} report to {res.get('output_file_path')}."
     return output
+
+
+# ---------------------------------------------------------------------------
+# Placeholder handlers for action kinds without dedicated implementations yet
+# ---------------------------------------------------------------------------
+
+
+def execute_project_columns_plan(df: pd.DataFrame, plan: Any) -> ExecutionOutput:
+    """Handler for project_columns action kind.
+
+    Selects a subset of columns from the DataFrame.
+    """
+    raise NotImplementedError(
+        "project_columns action handler is not yet implemented. "
+        "Add implementation in executor.py."
+    )
+
+
+def execute_drop_columns_plan(df: pd.DataFrame, plan: Any) -> ExecutionOutput:
+    """Handler for drop_columns action kind.
+
+    Drops specified columns from the DataFrame.
+    """
+    raise NotImplementedError(
+        "drop_columns action handler is not yet implemented. "
+        "Add implementation in executor.py."
+    )
+
+
+def execute_rename_columns_plan(df: pd.DataFrame, plan: Any) -> ExecutionOutput:
+    """Handler for rename_columns action kind.
+
+    Renames specified columns in the DataFrame.
+    """
+    raise NotImplementedError(
+        "rename_columns action handler is not yet implemented. "
+        "Add implementation in executor.py."
+    )
+
+
+def execute_sort_rows_plan(df: pd.DataFrame, plan: Any) -> ExecutionOutput:
+    """Handler for sort_rows action kind.
+
+    Sorts the DataFrame by specified columns.
+    """
+    raise NotImplementedError(
+        "sort_rows action handler is not yet implemented. "
+        "Add implementation in executor.py."
+    )
+
+
+def execute_limit_rows_plan(df: pd.DataFrame, plan: Any) -> ExecutionOutput:
+    """Handler for limit_rows action kind.
+
+    Limits the number of rows in the DataFrame.
+    """
+    raise NotImplementedError(
+        "limit_rows action handler is not yet implemented. "
+        "Add implementation in executor.py."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Action Handler Registry — maps action kind strings to handler functions
+# ---------------------------------------------------------------------------
+
+ACTION_HANDLERS: Dict[str, Callable] = {
+    "clean": execute_cleaning_plan,
+    "project_columns": execute_project_columns_plan,
+    "drop_columns": execute_drop_columns_plan,
+    "rename_columns": execute_rename_columns_plan,
+    "filter_rows": execute_filter_plan,
+    "sort_rows": execute_sort_rows_plan,
+    "limit_rows": execute_limit_rows_plan,
+    "calculate": execute_calculation_plan,
+    "visualize": execute_visualization_plan,
+    "report": execute_reporting_plan,
+}
+
+# Import-time coverage check: raises ImportError if any ActionKind member is missing
+# or if any unknown action kind is registered.
+check_action_kind_coverage(ACTION_HANDLERS)

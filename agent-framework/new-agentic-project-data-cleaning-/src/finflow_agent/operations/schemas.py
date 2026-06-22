@@ -1,6 +1,8 @@
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
+from finflow_agent.contract_registry import CanonicalOperator
+
 # -------------------------------------------------------------------
 # BASE VALIDATORS & HELPERS
 # -------------------------------------------------------------------
@@ -118,8 +120,7 @@ class CleaningOperationPlan(BaseModel):
 # -------------------------------------------------------------------
 class FilterCondition(BaseModel):
     column: str
-    operator: Literal["eq", "neq", "gt", "gte", "lt", "lte", "contains", "not_contains", 
-                     "starts_with", "ends_with", "between", "in", "not_in", "is_null", "is_not_null"]
+    operator: CanonicalOperator
     value: Optional[Any] = None
     value_to: Optional[Any] = None # For 'between'
     case_sensitive: bool = False

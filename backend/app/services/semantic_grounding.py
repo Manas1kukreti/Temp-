@@ -62,6 +62,7 @@ def ground_semantic_intent(
         seen_terms.add(term_lower)
 
         result = _ground_single_reference(user_term, source_columns)
+
         grounding_results.append(result)
         if result.needs_clarification or result.resolved_column is None:
             unresolved.append(user_term)

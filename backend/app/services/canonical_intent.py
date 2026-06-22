@@ -311,6 +311,7 @@ def _try_semantic_extraction(
     instruction: str,
     source_columns: list[str],
     *,
+    preview_rows: list[dict[str, Any]] | None = None,
     output_format: str = "xlsx",
     detected_types: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
@@ -324,8 +325,8 @@ def _try_semantic_extraction(
 
     logger = logging.getLogger(__name__)
 
-    # Only use semantic pipeline if GROQ_API_KEY is configured
-    if not os.environ.get("GROQ_API_KEY", ""):
+    # Only use semantic pipeline if GROQ_API_KEY or GROQ_BRIDGE_API_KEY is configured
+    if not os.environ.get("GROQ_API_KEY", "") and not os.environ.get("GROQ_BRIDGE_API_KEY", ""):
         return None
 
     # Don't use semantic pipeline for empty instructions
@@ -333,100 +334,29 @@ def _try_semantic_extraction(
         return None
 
     try:
-        from app.services.semantic_pipeline import run_semantic_pipeline_sync
+        # ---- Try the NEW semantic pipeline (finflow_agent) first ----
+        from app.services.new_pipeline_bridge import run_new_semantic_pipeline_sync
 
-        result = run_semantic_pipeline_sync(
+        new_result = run_new_semantic_pipeline_sync(
             instruction,
             source_columns,
             column_types=detected_types,
             output_format=output_format,
         )
+        if new_result is not None:
+            dataframe_profile = _build_dataframe_profile(source_columns, preview_rows or [], detected_types or {})
+            new_result = _repair_profile_grounded_references(new_result, dataframe_profile)
+            logger.info("New pipeline extraction succeeded for: %s", instruction[:80])
+            return new_result
 
-        if not result.success:
-            # Semantic extraction couldn't fully resolve — fall back to regex
-            logger.info(
-                "Semantic extraction did not fully resolve; falling back to deterministic: %s",
-                result.error,
-            )
-            return None
-
-        # Build a canonical intent from the semantic result
-        canonical_actions = result.canonical_actions
-        if not canonical_actions:
-            return None
-
-        # Convert semantic actions to typed IntentAction models
-        typed_actions = _semantic_actions_to_typed(canonical_actions, source_columns)
-        if not typed_actions:
-            return None
-
-        dataframe_profile = _build_dataframe_profile(source_columns, [], detected_types or {})
-        capability_snapshot_model = build_capability_snapshot()
-
-        grounded_references = _iter_grounded_references(typed_actions)
-        has_unresolved = any(
-            not item.get("resolved_column") and not item.get("resolved_columns")
-            for item in grounded_references
-        )
-
-        if has_unresolved:
-            resolution_status = "needs_clarification"
-        elif result.repair_notes:
-            resolution_status = "repaired"
-        else:
-            resolution_status = "resolved"
-
-        canonical = CanonicalIntent(
-            schema_version="2.0",
-            intent_hash="",
-            original_prompt=str(instruction or ""),
-            normalized_prompt=_normalize_text(instruction),
-            resolution_status=resolution_status,
-            decision=_build_decision_summary(typed_actions),
-            evidence=_dedupe_preserve_order(result.evidence),
-            alternatives_considered=[],
-            actions=typed_actions,
-            output_format=output_format if output_format in {"xlsx", "csv", "json", "txt"} else "xlsx",
-            assumptions=_dedupe_preserve_order(result.assumptions),
-            repair_notes=_dedupe_preserve_order(result.repair_notes),
-            dataframe_profile=dataframe_profile,
-            capability_version=capability_snapshot_model.capability_version,
-            capability_snapshot=capability_snapshot_model.model_dump(mode="json"),
-            grounded_at=datetime.now(UTC),
-        )
-        canonical.intent_hash = compute_intent_hash(canonical)
-        logger.info("Semantic extraction succeeded for: %s", instruction[:80])
-        return canonical.model_dump(mode="json")
+        # ---- Old semantic pipeline DISABLED to save LLM rate limit ----
+        # The new pipeline handles extraction; if it fails (rate limit, etc.)
+        # fall directly to deterministic regex instead of burning more tokens.
+        logger.info("New pipeline returned None; skipping old semantic pipeline to save rate limit")
+        return None
 
     except Exception as e:
-        error_str = str(e)
-        # If rate-limited, return an explicit error intent instead of falling back silently
-        if "rate_limit" in error_str or "429" in error_str:
-            logger.warning("Semantic extraction rate-limited: %s", e)
-            dataframe_profile = _build_dataframe_profile(source_columns, [], detected_types or {})
-            capability_snapshot_model = build_capability_snapshot()
-            canonical = CanonicalIntent(
-                schema_version="2.0",
-                intent_hash="",
-                original_prompt=str(instruction or ""),
-                normalized_prompt=_normalize_text(instruction),
-                resolution_status="needs_clarification",
-                decision="",
-                evidence=["LLM token rate limit reached. Please wait a few minutes and retry."],
-                alternatives_considered=[],
-                actions=[],
-                output_format=output_format if output_format in {"xlsx", "csv", "json", "txt"} else "xlsx",
-                assumptions=[],
-                repair_notes=["Rate limit exceeded on AI extraction service. Retry shortly."],
-                dataframe_profile=dataframe_profile,
-                capability_version=capability_snapshot_model.capability_version,
-                capability_snapshot=capability_snapshot_model.model_dump(mode="json"),
-                grounded_at=datetime.now(UTC),
-            )
-            canonical.intent_hash = compute_intent_hash(canonical)
-            return canonical.model_dump(mode="json")
-
-        logger.warning("Semantic extraction failed, falling back to deterministic: %s", e)
+        logger.warning("Semantic extraction error: %s", e)
         return None
 
 
@@ -575,7 +505,11 @@ def build_canonical_intent(
     # ---------------------------------------------------------------
     source_columns = [str(column) for column in source_columns if str(column).strip()]
     semantic_result = _try_semantic_extraction(
-        instruction, source_columns, output_format=output_format, detected_types=detected_types,
+        instruction,
+        source_columns,
+        preview_rows=preview_rows,
+        output_format=output_format,
+        detected_types=detected_types,
     )
     if semantic_result is not None:
         return semantic_result
@@ -716,7 +650,7 @@ def build_canonical_intent(
         grounded_at=datetime.now(UTC),
     )
     canonical.intent_hash = compute_intent_hash(canonical)
-    return canonical.model_dump(mode="json")
+    return _repair_profile_grounded_references(canonical.model_dump(mode="json"), dataframe_profile)
 
 
 def canonical_intent_to_legacy_action_schema(canonical_intent: dict[str, Any]) -> dict[str, Any]:
@@ -1073,6 +1007,305 @@ def _build_dataframe_profile(
         "semantic_roles": semantic_roles,
         "preview_values": preview_samples,
     }
+
+
+_GENERIC_FIELD_REFERENCES = {
+    "column",
+    "columns",
+    "field",
+    "fields",
+    "value",
+    "values",
+    "entry",
+    "entries",
+    "row",
+    "rows",
+    "record",
+    "records",
+    "which",
+    "that",
+}
+
+_PAYMENT_VALUE_HINTS = {
+    "paypal",
+    "pay",
+    "cash",
+    "card",
+    "credit",
+    "debit",
+    "upi",
+    "wallet",
+    "bank",
+    "transfer",
+    "visa",
+    "mastercard",
+}
+
+_STATUS_VALUE_HINTS = {
+    "pending",
+    "completed",
+    "complete",
+    "failed",
+    "approved",
+    "rejected",
+    "declined",
+    "processing",
+    "open",
+    "closed",
+    "cancelled",
+    "canceled",
+}
+
+
+def _repair_profile_grounded_references(
+    canonical_intent: dict[str, Any],
+    dataframe_profile: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list) or not isinstance(dataframe_profile, dict):
+        return canonical_intent
+
+    repaired_any = False
+    unresolved_before = _count_unresolved_action_references(actions)
+
+    for action in actions:
+        if not isinstance(action, dict) or str(action.get("kind", "")).strip() != "filter_rows":
+            continue
+        conditions = action.get("conditions")
+        if not isinstance(conditions, list):
+            continue
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            field = condition.get("field")
+            if not isinstance(field, dict):
+                continue
+            if field.get("resolved_column") or field.get("resolved_columns"):
+                continue
+            grounded = _ground_filter_field_from_profile(
+                field=field,
+                operator=str(condition.get("operator", "eq")).strip(),
+                value=condition.get("value"),
+                dataframe_profile=dataframe_profile,
+            )
+            if grounded is None:
+                continue
+            condition["field"] = grounded
+            repaired_any = True
+
+    if not repaired_any:
+        return canonical_intent
+
+    unresolved_after = _count_unresolved_action_references(actions)
+    repair_notes = canonical_intent.get("repair_notes")
+    if not isinstance(repair_notes, list):
+        repair_notes = []
+        canonical_intent["repair_notes"] = repair_notes
+    repair_notes.append("Resolved one or more generic filter references using schema and preview-value evidence.")
+    canonical_intent["repair_notes"] = _dedupe_preserve_order(repair_notes)
+
+    if unresolved_after < unresolved_before:
+        evidence = canonical_intent.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+            canonical_intent["evidence"] = evidence
+        evidence.append("Profile-aware grounding resolved previously generic filter references.")
+        canonical_intent["evidence"] = _dedupe_preserve_order(evidence)
+
+    if unresolved_after == 0 and str(canonical_intent.get("resolution_status", "")).strip() == "needs_clarification":
+        canonical_intent["resolution_status"] = "repaired"
+
+    return canonical_intent
+
+
+def _count_unresolved_action_references(actions: list[Any]) -> int:
+    unresolved = 0
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        kind = str(action.get("kind", "")).strip()
+        if kind in {"project_columns", "drop_columns"}:
+            for field in action.get("requested_fields", []):
+                if isinstance(field, dict) and not field.get("resolved_column") and not field.get("resolved_columns"):
+                    unresolved += 1
+        elif kind == "filter_rows":
+            for condition in action.get("conditions", []):
+                if not isinstance(condition, dict):
+                    continue
+                field = condition.get("field")
+                if isinstance(field, dict) and not field.get("resolved_column") and not field.get("resolved_columns"):
+                    unresolved += 1
+        elif kind == "rename_columns":
+            for mapping in action.get("mapping", []):
+                if not isinstance(mapping, dict):
+                    continue
+                source = mapping.get("source")
+                if isinstance(source, dict) and not source.get("resolved_column") and not source.get("resolved_columns"):
+                    unresolved += 1
+        elif kind == "sort_rows":
+            for item in action.get("sort_keys", []):
+                if not isinstance(item, dict):
+                    continue
+                column = item.get("column")
+                if isinstance(column, dict) and not column.get("resolved_column") and not column.get("resolved_columns"):
+                    unresolved += 1
+    return unresolved
+
+
+def _ground_filter_field_from_profile(
+    *,
+    field: dict[str, Any],
+    operator: str,
+    value: Any,
+    dataframe_profile: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_reference = str(field.get("raw_reference", "")).strip()
+    source_columns = [
+        str(column)
+        for column in dataframe_profile.get("source_columns", [])
+        if str(column).strip()
+    ]
+    if not raw_reference or not source_columns:
+        return None
+
+    role_columns = dataframe_profile.get("semantic_roles", {})
+    preview_values = dataframe_profile.get("preview_values", {})
+    detected_types = {
+        str(key): str(val).strip().lower()
+        for key, val in (dataframe_profile.get("detected_types") or {}).items()
+    }
+
+    requested_tokens = set(_normalize_reference(raw_reference).split())
+    generic_reference = not requested_tokens or requested_tokens <= _GENERIC_FIELD_REFERENCES
+    value_strings = _flatten_filter_values(value)
+    value_tokens = _value_tokens(value_strings)
+    compact_values = {_compact_token(value_string) for value_string in value_strings if _compact_token(value_string)}
+    value_concepts = _value_concepts(value_tokens, value_strings)
+
+    scored: list[tuple[float, str, list[str]]] = []
+    for column in source_columns:
+        score = 0.0
+        evidence: list[str] = []
+        column_normalized = normalize_semantic_name(column)
+        preview_strings = [str(item) for item in preview_values.get(column, []) if str(item).strip()]
+        preview_tokens = _value_tokens(preview_strings)
+        preview_compact = {_compact_token(item) for item in preview_strings if _compact_token(item)}
+
+        if not generic_reference:
+            overlap = requested_tokens & set(column_normalized.replace("_", " ").split())
+            if overlap:
+                score += 0.30
+                evidence.append(f"field_overlap={sorted(overlap)}")
+            semantic_aliases = {
+                _normalize_reference(alias)
+                for alias in _semantic_role_aliases(column_normalized)
+            }
+            alias_overlap = requested_tokens & {token for alias in semantic_aliases for token in alias.split()}
+            if alias_overlap:
+                score += 0.20
+                evidence.append(f"semantic_alias_overlap={sorted(alias_overlap)}")
+
+        exact_value_overlap = compact_values & preview_compact
+        if exact_value_overlap:
+            score += 0.55
+            evidence.append(f"value_preview_overlap={sorted(exact_value_overlap)}")
+        elif value_tokens and preview_tokens:
+            token_overlap = value_tokens & preview_tokens
+            if token_overlap:
+                score += 0.20
+                evidence.append(f"value_token_overlap={sorted(token_overlap)}")
+
+        column_roles = {
+            role
+            for role, values in role_columns.items()
+            if isinstance(values, list) and column in values
+        }
+        if "payment" in value_concepts:
+            if {"merchant", "payment_value"} & column_roles:
+                score += 0.35
+                evidence.append("payment-like value matches payment-oriented semantic role")
+            if "payment" in column_normalized or "method" in column_normalized or "gateway" in column_normalized:
+                score += 0.15
+                evidence.append("column name is payment-oriented")
+        if "status" in value_concepts:
+            if "status" in column_roles or "status" in column_normalized:
+                score += 0.35
+                evidence.append("status-like value matches status-oriented column")
+        if "date" in value_concepts:
+            if "date" in column_roles or detected_types.get(column) == "date":
+                score += 0.35
+                evidence.append("date-like value matches date-oriented column")
+        if "numeric" in value_concepts and detected_types.get(column) == "number":
+            score += 0.20
+            evidence.append("numeric-like value matches numeric column type")
+
+        if operator == "contains" and detected_types.get(column) == "string":
+            score += 0.05
+            evidence.append("contains operator favors string-like columns")
+
+        scored.append((score, column, evidence))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored:
+        return None
+
+    best_score, best_column, best_evidence = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score < 0.55 or (best_score - second_score) < 0.15:
+        return None
+
+    return {
+        **field,
+        "resolved_column": best_column,
+        "resolved_columns": [best_column],
+        "candidate_columns": [column for _score, column, _evidence in scored[:3]],
+        "selection_mode": "single",
+        "resolution_method": "profile_semantic_match",
+        "evidence": _dedupe_preserve_order(list(field.get("evidence", [])) + best_evidence),
+    }
+
+
+def _flatten_filter_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _compact_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _value_tokens(values: list[str]) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        normalized = _normalize_reference(value)
+        if normalized:
+            tokens.update(token for token in normalized.split() if token)
+        compact = _compact_token(value)
+        if compact:
+            tokens.add(compact)
+    return tokens
+
+
+def _value_concepts(value_tokens: set[str], value_strings: list[str]) -> set[str]:
+    concepts: set[str] = set()
+    if value_tokens & _PAYMENT_VALUE_HINTS:
+        concepts.add("payment")
+    if value_tokens & _STATUS_VALUE_HINTS:
+        concepts.add("status")
+    if any(re.fullmatch(r"-?\d+(?:\.\d+)?", item) for item in value_strings):
+        concepts.add("numeric")
+    if any(re.fullmatch(r"\d{4}-\d{2}-\d{2}", item) for item in value_strings):
+        concepts.add("date")
+    if value_strings:
+        concepts.add("text")
+    return concepts
 
 
 def _extract_requested_columns(
