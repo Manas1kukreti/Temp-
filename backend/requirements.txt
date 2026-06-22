@@ -16,3 +16,4 @@ passlib[bcrypt]==1.7.4
 email-validator==2.2.0
 PyJWT>=2.8.0
 arq
+pdfplumber==0.11.4

@@ -45,6 +45,8 @@ from finflow_agent.contract_registry import (
     UnmappedSemanticTypeError,
 )
 from finflow_agent.operations.schemas import (
+    CalculationOperation,
+    CalculationOperationPlan,
     CleaningOperationPlan,
     DropDuplicatesOperation,
     DropNullsOperation,
@@ -115,6 +117,7 @@ CANONICAL_OUTPUT_KEYS: frozenset[str] = frozenset(
         "df_cleaned",
         "df_filter_prepared",
         "df_filtered",
+        "df_calculated",
         "df_visualized",
         "report_output",
     }
@@ -431,6 +434,27 @@ def compile_intent_to_plan(
         last_df_key = "df_cleaned"
 
     # ------------------------------------------------------------------
+    # 2.5. Calculation step (after filter/clean, before visualization).
+    # ------------------------------------------------------------------
+    if intent.needs_calculation and intent.calculation_plan is not None:
+        steps.append(
+            PlanStep(
+                step_id="calculate",
+                agent="calculation_agent",
+                params={
+                    "operations": [
+                        op.model_dump() if hasattr(op, "model_dump") else op
+                        for op in intent.calculation_plan.operations
+                    ],
+                },
+                depends_on=[steps[-1].step_id],
+                input_from=[last_df_key],
+                output_key="df_calculated",
+            )
+        )
+        last_df_key = "df_calculated"
+
+    # ------------------------------------------------------------------
     # 3. Visualization (scaffolded; gated by ENABLE_VISUALIZATION).
     #
     #    Only entered when the intent both requested visualization and
@@ -546,6 +570,7 @@ def _canonical_intent_to_plan_intent(
 
     cleaning_plan: CleaningOperationPlan | None = None
     filter_plan: FilterOperationPlan | None = None
+    calculation_plan: CalculationOperationPlan | None = None
     needs_cleaning = False
     needs_filtering = False
     needs_calculation = False
@@ -556,6 +581,7 @@ def _canonical_intent_to_plan_intent(
     filter_logic = "and"
     filter_limit: int | None = None
     drop_columns_seen = False
+    calculation_operations: list = []
 
     for action in intent.actions:
         # Resolve the semantic operation type to a canonical action kind via
@@ -596,8 +622,11 @@ def _canonical_intent_to_plan_intent(
         if isinstance(action, SortRowsIntent):
             raise ValueError("Canonical sort_rows intent is not supported by the current compiler.")
         if isinstance(action, CalculateIntent):
-            needs_calculation = True
-            raise ValueError("Canonical calculate intent is not supported by the current compiler.")
+            ops = _build_calculation_operations(action)
+            if ops:
+                needs_calculation = True
+                calculation_operations = ops
+            continue
         if isinstance(action, VisualizeIntent):
             needs_visualization = True
             raise ValueError("Canonical visualize intent is not supported by the current compiler.")
@@ -618,6 +647,14 @@ def _canonical_intent_to_plan_intent(
         )
         needs_filtering = True
 
+    if calculation_operations:
+        calculation_plan = CalculationOperationPlan(
+            operations=[
+                CalculationOperation(**op) if isinstance(op, dict) else op
+                for op in calculation_operations
+            ]
+        )
+
     return PlanIntent(
         needs_cleaning=needs_cleaning,
         needs_filtering=needs_filtering,
@@ -626,13 +663,31 @@ def _canonical_intent_to_plan_intent(
         output_format=intent.output_format,
         cleaning_plan=cleaning_plan,
         filter_plan=filter_plan,
+        calculation_plan=calculation_plan,
         reporting_title=intent.decision or None,
         sheet_name=None,
     )
 
 
+def _build_calculation_operations(action: CalculateIntent) -> list:
+    """Build calculation operations from a CalculateIntent action."""
+    operations = []
+    for op in action.operations:
+        if isinstance(op, dict):
+            operations.append(op)
+        elif isinstance(op, str):
+            # Legacy format: just a string description — skip
+            continue
+        else:
+            operations.append(op)
+    return operations
+
+
 def _source_columns_from_intent(intent: CanonicalIntent, resolved_file_path: str) -> list[str]:
     profile_columns = intent.dataframe_profile.get("source_columns")
+    if not isinstance(profile_columns, list):
+        # Fallback: some pipelines emit "columns" instead of "source_columns"
+        profile_columns = intent.dataframe_profile.get("columns")
     if isinstance(profile_columns, list):
         columns = [str(column).strip() for column in profile_columns if str(column).strip()]
         if columns:
@@ -716,17 +771,24 @@ def _canonical_filter_conditions(
     mode: str,
 ) -> list[FilterCondition]:
     if mode == "keep":
-        return [
-            FilterCondition(
-                column=_resolve_single_grounded_column(condition.field),
-                operator=_resolved_semantic_operator(condition.operator),
-                value=condition.value,
+        result = []
+        for condition in conditions:
+            # Skip conditions with unresolved generic field references
+            if not _can_resolve_field(condition.field):
+                continue
+            result.append(
+                FilterCondition(
+                    column=_resolve_single_grounded_column(condition.field),
+                    operator=_resolved_semantic_operator(condition.operator),
+                    value=condition.value,
+                )
             )
-            for condition in conditions
-        ]
+        return result
 
     inverted: list[FilterCondition] = []
     for condition in conditions:
+        if not _can_resolve_field(condition.field):
+            continue
         operator = _invert_operator(condition.operator)
         inverted.append(
             FilterCondition(
@@ -736,6 +798,23 @@ def _canonical_filter_conditions(
             )
         )
     return inverted
+
+
+def _can_resolve_field(field) -> bool:
+    """Check if a field reference can be resolved to a column name."""
+    if hasattr(field, "resolved_column") and field.resolved_column:
+        return True
+    if hasattr(field, "resolved_columns") and field.resolved_columns:
+        return True
+    # Generic/unresolved references cannot be compiled
+    raw_ref = str(getattr(field, "raw_reference", "") or "").strip().lower()
+    if raw_ref in {"generic", "", "unknown", "null", "none"}:
+        return False
+    # If resolution_method is generic_reference with no resolved column, skip
+    method = str(getattr(field, "resolution_method", "") or "").strip().lower()
+    if method == "generic_reference":
+        return False
+    return False
 
 
 def _resolve_single_grounded_column(field: UnresolvedColumnReference) -> str:

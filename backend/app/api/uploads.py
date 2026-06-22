@@ -56,7 +56,7 @@ CONTENT_TYPE_ALLOWLIST = {
 }
 
 SCHEMA_APPROVAL_AGENT_STATUS = "awaiting_schema_approval"
-SCHEMA_APPROVAL_TABULAR_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt"}
+SCHEMA_APPROVAL_TABULAR_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt", ".pdf"}
 FAILED_SUBMISSION_STATUSES = {SubmissionStatus.failed.value, SubmissionStatus.callback_failed.value}
 EXPLICIT_CLEANING_TERMS = (
     "clean",

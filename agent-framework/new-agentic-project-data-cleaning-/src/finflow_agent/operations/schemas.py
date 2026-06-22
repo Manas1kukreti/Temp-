@@ -167,13 +167,21 @@ class FilterOperationPlan(BaseModel):
 class CalculationOperation(BaseModel):
     type: Literal["sum", "mean", "median", "min", "max", "count", "count_distinct", 
                   "variance", "standard_deviation", "group_sum", "group_mean", "group_count", 
-                  "running_total", "percentage_change", "difference", "ratio", "absolute_value"]
+                  "running_total", "percentage_change", "difference", "ratio", "absolute_value",
+                  "conditional_percentage", "quarterly_sum", "quarterly_mean", "quarterly_count"]
     column: str
     output_column: Optional[str] = None
     group_by: Optional[List[str]] = None
-    secondary_column: Optional[str] = None # For ratio, difference, percentage_change
+    secondary_column: Optional[str] = None  # For ratio, difference, percentage_change
     sort_by: Optional[str] = None
     partition_by: Optional[List[str]] = None
+    # For conditional_percentage: filter criteria
+    filter_column: Optional[str] = None
+    filter_value: Optional[Any] = None
+    denominator_filter_column: Optional[str] = None
+    denominator_filter_value: Optional[Any] = None
+    # For quarterly operations: date column
+    date_column: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -191,6 +199,12 @@ class CalculationOperation(BaseModel):
         elif t in ["ratio", "difference"]:
             if not data.get("secondary_column"):
                 raise ValueError(f"Operator '{t}' requires secondary_column.")
+        elif t == "conditional_percentage":
+            if not data.get("filter_column") or data.get("filter_value") is None:
+                raise ValueError("conditional_percentage requires filter_column and filter_value.")
+        elif t in ["quarterly_sum", "quarterly_mean", "quarterly_count"]:
+            if not data.get("date_column"):
+                raise ValueError(f"Operator '{t}' requires date_column.")
         return data
 
 class CalculationOperationPlan(BaseModel):

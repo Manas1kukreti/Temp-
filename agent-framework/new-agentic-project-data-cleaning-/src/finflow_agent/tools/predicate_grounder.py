@@ -292,7 +292,18 @@ def _score_candidate(
     semantic: SemanticColumnProfile,
 ) -> GroundingCandidate:
     requested_tokens = _field_tokens(clause.requested_field)
-    value_concepts = _value_concepts(clause.value)
+    # When the filter value is an aggregate reference (dict with "type"/"function"
+    # key), treat it as a numeric comparison with no specific literal to match.
+    clause_value = clause.value
+    if isinstance(clause_value, dict) and (
+        clause_value.get("type") in {"aggregate", "average", "avg", "sum", "min", "max", "median", "count", "std"}
+        or "function" in clause_value
+        or "agg_func" in clause_value
+    ):
+        clause_value = None
+    value_concepts = _value_concepts(clause_value)
+    if clause_value is None and clause.operator in {"gt", "gte", "lt", "lte"}:
+        value_concepts = {"numeric"}
     broad_type = semantic.broad_type
     positive: list[str] = []
     negative: list[str] = []
@@ -308,8 +319,8 @@ def _score_candidate(
     # semantic tags, it's strong evidence this is the right column.
     # This breaks ties like education_level vs loan_purpose where both
     # have "education" in tags but only education_level has "phd".
-    if clause.value is not None:
-        value_tokens = _tokenize(clause.value)
+    if clause_value is not None:
+        value_tokens = _tokenize(clause_value)
         value_tag_overlap = value_tokens & set(semantic.semantic_tags)
         if value_tag_overlap:
             score += 0.25

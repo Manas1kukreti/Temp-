@@ -9,7 +9,7 @@ from finflow_agent.operations.errors import UnsafeInputPathError
 
 class IngestionAgentParams(BaseModel):
     resolved_file_path: str
-    file_type: Literal["xlsx", "xls", "csv"]
+    file_type: Literal["xlsx", "xls", "csv", "pdf"]
 
 @registry.register
 class IngestionAgent:
@@ -54,13 +54,13 @@ class IngestionAgent:
                 ),
             )
 
-        if file_type not in ["xlsx", "xls", "csv"]:
+        if file_type not in ["xlsx", "xls", "csv", "pdf"]:
             return AgentResult(
                 status="failed",
                 error_message=(
                     "Unsupported file type for IngestionAgent: "
                     f"file_type={file_type!r}, path={resolved_file_path!r}. "
-                    "Allowed values: 'xlsx', 'xls', 'csv'."
+                    "Allowed values: 'xlsx', 'xls', 'csv', 'pdf'."
                 ),
             )
 
@@ -96,6 +96,8 @@ class IngestionAgent:
         try:
             if file_type == "csv":
                 df = pd.read_csv(resolved_file_path)
+            elif file_type == "pdf":
+                df = self._parse_pdf(resolved_file_path)
             else:
                 df = pd.read_excel(resolved_file_path)
 
@@ -123,3 +125,35 @@ class IngestionAgent:
                     f"(file_type={file_type!r}, path={resolved_file_path!r}): {e}"
                 ),
             )
+
+    @staticmethod
+    def _parse_pdf(file_path: str) -> pd.DataFrame:
+        """Extract tabular data from a PDF file using pdfplumber."""
+        import pdfplumber
+
+        frames: list[pd.DataFrame] = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    headers = [str(cell or "").strip() for cell in table[0]]
+                    if not any(headers):
+                        continue
+                    rows = []
+                    for row in table[1:]:
+                        rows.append([str(cell or "").strip() if cell is not None else "" for cell in row])
+                    if rows:
+                        frames.append(pd.DataFrame(rows, columns=headers))
+
+        if not frames:
+            raise ValueError(
+                "No tabular data found in PDF. The file must contain at least "
+                "one table with a header row."
+            )
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.dropna(how="all")
+        combined = combined.loc[:, combined.columns.map(lambda c: bool(str(c).strip()))]
+        return combined

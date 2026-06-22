@@ -199,6 +199,156 @@ def calc_absolute_value(df: pd.DataFrame, op: CalculationOperation) -> Dict[str,
     df[out_col] = df[op.column].abs()
     return {"df": df}
 
+
+# ---------------------------------------------------------------------------
+# Conditional Percentage
+# ---------------------------------------------------------------------------
+
+def calc_conditional_percentage(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Calculate percentage of records matching a condition.
+
+    Supports queries like:
+    - "Percentage of female employees who are single" →
+      filter_column=gender, filter_value=female, column=marital_status,
+      secondary_column=single, denominator_filter_column=gender,
+      denominator_filter_value=female
+    - "Percentage of total employees who are single" →
+      filter_column=marital_status, filter_value=single (no denominator filter)
+
+    The denominator is determined by:
+    - If denominator_filter_column + denominator_filter_value → count of rows matching that filter
+    - Otherwise → total row count
+    """
+    filter_col = op.filter_column
+    filter_val = op.filter_value
+
+    if not filter_col or filter_val is None:
+        raise OperationExecutionError(
+            "conditional_percentage requires filter_column and filter_value."
+        )
+
+    # Determine denominator
+    if op.denominator_filter_column and op.denominator_filter_value is not None:
+        denom_mask = df[op.denominator_filter_column].astype(str).str.lower().str.strip() == str(op.denominator_filter_value).lower().strip()
+        denominator = int(denom_mask.sum())
+        denom_label = f"{op.denominator_filter_column}={op.denominator_filter_value}"
+    else:
+        denominator = len(df)
+        denom_label = "total"
+
+    if denominator == 0:
+        raise OperationExecutionError(
+            f"Denominator is zero for conditional_percentage "
+            f"(denominator_filter: {denom_label})."
+        )
+
+    # Count numerator: rows matching BOTH denominator filter AND the target condition
+    if op.denominator_filter_column and op.denominator_filter_value is not None:
+        base_mask = df[op.denominator_filter_column].astype(str).str.lower().str.strip() == str(op.denominator_filter_value).lower().strip()
+        target_mask = df[filter_col].astype(str).str.lower().str.strip() == str(filter_val).lower().strip()
+        numerator = int((base_mask & target_mask).sum())
+    else:
+        target_mask = df[filter_col].astype(str).str.lower().str.strip() == str(filter_val).lower().strip()
+        numerator = int(target_mask.sum())
+
+    percentage = round((numerator / denominator) * 100, 2)
+    out_col = op.output_column or f"pct_{filter_col}_{filter_val}"
+    out_col = out_col.replace(" ", "_").lower()
+
+    return {
+        "metrics": {
+            out_col: percentage,
+            f"{out_col}_numerator": numerator,
+            f"{out_col}_denominator": denominator,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Quarterly Aggregation
+# ---------------------------------------------------------------------------
+
+def _ensure_datetime_column(df: pd.DataFrame, date_col: str) -> pd.Series:
+    """Coerce a column to datetime, handling common formats."""
+    if pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        return df[date_col]
+    return pd.to_datetime(df[date_col], errors="coerce", dayfirst=False)
+
+
+def calc_quarterly_sum(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Calculate sum grouped by quarter from a date column."""
+    _check_numeric(df, op.column)
+    date_col = op.date_column
+    if not date_col:
+        raise OperationExecutionError("quarterly_sum requires date_column.")
+
+    dates = _ensure_datetime_column(df, date_col)
+    df = df.copy()
+    df["__quarter__"] = dates.dt.to_period("Q").astype(str)
+    df = df.dropna(subset=["__quarter__"])
+
+    out_col = op.output_column or f"quarterly_sum_{op.column}"
+    grouped = df.groupby("__quarter__", as_index=False)[op.column].sum()
+    grouped.rename(columns={op.column: out_col, "__quarter__": "quarter"}, inplace=True)
+    grouped[out_col] = _round_series_if_currency(grouped[out_col], out_col)
+    grouped = grouped.sort_values("quarter").reset_index(drop=True)
+
+    # Add period_start for machine-sortable ordering
+    grouped["period_start"] = grouped["quarter"].apply(
+        lambda q: pd.Period(q, freq="Q").start_time.strftime("%Y-%m-%d")
+    )
+
+    return {"df": grouped}
+
+
+def calc_quarterly_mean(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Calculate mean grouped by quarter from a date column."""
+    _check_numeric(df, op.column)
+    date_col = op.date_column
+    if not date_col:
+        raise OperationExecutionError("quarterly_mean requires date_column.")
+
+    dates = _ensure_datetime_column(df, date_col)
+    df = df.copy()
+    df["__quarter__"] = dates.dt.to_period("Q").astype(str)
+    df = df.dropna(subset=["__quarter__"])
+
+    out_col = op.output_column or f"quarterly_mean_{op.column}"
+    grouped = df.groupby("__quarter__", as_index=False)[op.column].mean()
+    grouped.rename(columns={op.column: out_col, "__quarter__": "quarter"}, inplace=True)
+    grouped[out_col] = _round_series_if_currency(grouped[out_col], out_col)
+    grouped = grouped.sort_values("quarter").reset_index(drop=True)
+
+    grouped["period_start"] = grouped["quarter"].apply(
+        lambda q: pd.Period(q, freq="Q").start_time.strftime("%Y-%m-%d")
+    )
+
+    return {"df": grouped}
+
+
+def calc_quarterly_count(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Calculate count grouped by quarter from a date column."""
+    date_col = op.date_column
+    if not date_col:
+        raise OperationExecutionError("quarterly_count requires date_column.")
+
+    dates = _ensure_datetime_column(df, date_col)
+    df = df.copy()
+    df["__quarter__"] = dates.dt.to_period("Q").astype(str)
+    df = df.dropna(subset=["__quarter__"])
+
+    out_col = op.output_column or f"quarterly_count_{op.column}"
+    grouped = df.groupby("__quarter__", as_index=False).size()
+    grouped.rename(columns={"size": out_col, "__quarter__": "quarter"}, inplace=True)
+    grouped = grouped.sort_values("quarter").reset_index(drop=True)
+
+    grouped["period_start"] = grouped["quarter"].apply(
+        lambda q: pd.Period(q, freq="Q").start_time.strftime("%Y-%m-%d")
+    )
+
+    return {"df": grouped}
+
+
 CALCULATION_HANDLERS = {
     "sum": calc_sum,
     "mean": calc_mean,
@@ -217,4 +367,8 @@ CALCULATION_HANDLERS = {
     "difference": calc_difference,
     "ratio": calc_ratio,
     "absolute_value": calc_absolute_value,
+    "conditional_percentage": calc_conditional_percentage,
+    "quarterly_sum": calc_quarterly_sum,
+    "quarterly_mean": calc_quarterly_mean,
+    "quarterly_count": calc_quarterly_count,
 }

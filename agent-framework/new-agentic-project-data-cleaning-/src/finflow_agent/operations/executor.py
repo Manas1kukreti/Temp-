@@ -79,6 +79,87 @@ def execute_cleaning_plan(df: pd.DataFrame, plan: CleaningOperationPlan) -> Exec
     output.summary = f"Successfully applied {len(plan.operations)} cleaning operations."
     return output
 
+
+def _resolve_aggregate_value(df: pd.DataFrame, cond) -> "FilterCondition":
+    """Resolve aggregate value references in filter conditions.
+
+    When a condition's value is a dict representing an aggregate function
+    (e.g., {"type": "aggregate", "agg_func": "avg", ...} or {"function": "avg", ...}),
+    compute the aggregate from the dataframe and return a new condition with the
+    resolved scalar value. Returns the original condition unchanged if value is not
+    an aggregate reference.
+    """
+    from finflow_agent.operations.schemas import FilterCondition
+
+    value = cond.value
+    if not isinstance(value, dict):
+        return cond
+
+    is_aggregate = (
+        value.get("type") in {"aggregate", "average", "avg", "sum", "min", "max", "median", "count", "std"}
+        or "agg_func" in value
+        or "function" in value
+    )
+    if not is_aggregate:
+        return cond
+
+    agg_func = str(
+        value.get("agg_func") or value.get("function") or value.get("type") or "avg"
+    ).strip().lower()
+
+    field_ref = value.get("field_ref")
+    if isinstance(field_ref, dict):
+        agg_column = (
+            field_ref.get("resolved_column")
+            or field_ref.get("reference_text")
+            or cond.column
+        )
+    else:
+        agg_column = cond.column
+
+    col_lower_map = {c.lower(): c for c in df.columns}
+    resolved_col = col_lower_map.get(agg_column.lower(), agg_column)
+    if resolved_col not in df.columns:
+        resolved_col = cond.column
+
+    raw_series = df[resolved_col].astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
+    numeric_series = pd.to_numeric(raw_series, errors="coerce")
+
+    agg_map = {
+        "avg": numeric_series.mean,
+        "mean": numeric_series.mean,
+        "average": numeric_series.mean,
+        "sum": numeric_series.sum,
+        "min": numeric_series.min,
+        "max": numeric_series.max,
+        "median": numeric_series.median,
+        "count": numeric_series.count,
+        "std": numeric_series.std,
+    }
+    compute_fn = agg_map.get(agg_func)
+    if compute_fn is None:
+        raise UnsupportedOperationError(
+            f"Unsupported aggregate function in filter value: {agg_func!r}"
+        )
+
+    resolved_value = compute_fn()
+
+    target_col = cond.column
+    if target_col not in df.columns:
+        target_col = col_lower_map.get(target_col.lower(), target_col)
+    if target_col in df.columns and not pd.api.types.is_numeric_dtype(df[target_col]):
+        stripped = df[target_col].astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
+        df[target_col] = pd.to_numeric(stripped, errors="coerce")
+
+    return FilterCondition(
+        column=target_col,
+        operator=cond.operator,
+        value=resolved_value,
+        value_to=cond.value_to,
+        case_sensitive=cond.case_sensitive,
+    )
+
+
 def execute_filter_plan(df: pd.DataFrame, plan: FilterOperationPlan) -> ExecutionOutput:
     output = ExecutionOutput(data=df.copy())
     initial_rows = len(output.data)
@@ -120,12 +201,15 @@ def execute_filter_plan(df: pd.DataFrame, plan: FilterOperationPlan) -> Executio
     masks = []
     for cond in plan.conditions:
         validate_columns_exist(output.data, cond.column)
-            
-        handler = FILTER_HANDLERS.get(cond.operator)
+
+        # Resolve aggregate value references (e.g., {"type": "aggregate", "agg_func": "avg"})
+        resolved_cond = _resolve_aggregate_value(output.data, cond)
+
+        handler = FILTER_HANDLERS.get(resolved_cond.operator)
         if not handler:
-            raise UnsupportedOperationError(f"No filter handler found for {cond.operator}")
+            raise UnsupportedOperationError(f"No filter handler found for {resolved_cond.operator}")
             
-        mask = handler(output.data[cond.column], cond)
+        mask = handler(output.data[resolved_cond.column], resolved_cond)
         masks.append(mask)
         
     if masks:
@@ -170,7 +254,10 @@ def execute_filter_plan(df: pd.DataFrame, plan: FilterOperationPlan) -> Executio
     return output
 
 def execute_calculation_plan(df: pd.DataFrame, plan: CalculationOperationPlan) -> ExecutionOutput:
+    from finflow_agent.operations.result_builder import normalize_handler_result
+
     output = ExecutionOutput(data=df.copy())
+    operation_results: list[dict] = []
     
     for op in plan.operations:
         req_cols = required_columns_for_operation(op)
@@ -194,6 +281,10 @@ def execute_calculation_plan(df: pd.DataFrame, plan: CalculationOperationPlan) -
             output.data = res["df"]
         if "warnings" in res:
             output.warnings.extend(res["warnings"])
+
+        # Normalize handler result into the shared OperationResult contract
+        op_result = normalize_handler_result(res, op)
+        operation_results.append(op_result.model_dump(mode="json"))
             
         finished_at = int(time.time() * 1000)
         output_cols = list(output.data.columns)
@@ -218,7 +309,9 @@ def execute_calculation_plan(df: pd.DataFrame, plan: CalculationOperationPlan) -
             "params_hash": hash_operation_params(op),
             "column": op.column
         })
-        
+
+    # Attach normalized operation results to artifacts
+    output.artifacts["operation_results"] = operation_results
     output.summary = f"Successfully calculated {len(plan.operations)} metrics."
     return output
 

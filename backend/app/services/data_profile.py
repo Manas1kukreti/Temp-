@@ -60,6 +60,8 @@ def build_data_profile_from_file(
         frame, total_rows = _load_json_frame(path, max_preview_rows=max_preview_rows)
     elif extension == ".txt":
         frame, total_rows = _load_text_frame(path, max_preview_rows=max_preview_rows)
+    elif extension == ".pdf":
+        frame, total_rows = _load_pdf_frame(path, max_preview_rows=max_preview_rows)
     else:
         return None
 
@@ -210,6 +212,58 @@ def _load_json_frame(path: Path, *, max_preview_rows: int) -> tuple[pd.DataFrame
         return None, 0
     total_rows = len(rows)
     return pd.DataFrame(rows[:max_preview_rows]), total_rows
+
+
+def _load_pdf_frame(path: Path, *, max_preview_rows: int) -> tuple[pd.DataFrame | None, int]:
+    """Extract tabular data from a PDF file using pdfplumber."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return None, 0
+
+    frames: list[pd.DataFrame] = []
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    headers = [str(cell or "").strip() for cell in table[0]]
+                    if not any(headers):
+                        continue
+                    rows = []
+                    for row in table[1:]:
+                        rows.append([str(cell or "").strip() if cell is not None else "" for cell in row])
+                    if rows:
+                        frames.append(pd.DataFrame(rows, columns=headers))
+    except Exception:
+        return None, 0
+
+    if not frames:
+        try:
+            with pdfplumber.open(path) as pdf:
+                lines: list[str] = []
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        lines.extend(line.strip() for line in text.splitlines() if line.strip())
+            if not lines:
+                return None, 0
+            total_rows = len(lines)
+            preview_lines = lines[:max_preview_rows]
+            return pd.DataFrame([{"line_number": i + 1, "raw_text": line} for i, line in enumerate(preview_lines)]), total_rows
+        except Exception:
+            return None, 0
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.dropna(how="all")
+    combined = combined.loc[:, combined.columns.map(lambda c: bool(str(c).strip()))]
+    combined.columns = [_normalize_source_column(column) for column in combined.columns]
+    total_rows = len(combined)
+    if total_rows > max_preview_rows:
+        combined = combined.head(max_preview_rows)
+    return combined, total_rows
 
 
 def _load_text_frame(path: Path, *, max_preview_rows: int) -> tuple[pd.DataFrame | None, int]:

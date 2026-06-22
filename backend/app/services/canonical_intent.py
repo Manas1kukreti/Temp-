@@ -400,6 +400,7 @@ def _try_semantic_extraction(
             new_result = _repair_select_all_projection(new_result, instruction=instruction, source_columns=source_columns)
             new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
             new_result = _repair_null_row_cleanup(new_result, instruction=instruction)
+            new_result = _repair_missing_clean_action(new_result, instruction=instruction)
             if isinstance(new_result, dict):
                 new_result["intent_hash"] = compute_intent_hash(new_result)
             logger.info("New pipeline extraction succeeded for: %s", instruction[:80])
@@ -682,7 +683,12 @@ def build_canonical_intent(
         actions.append(limit_action)
         evidence.append("The instruction constrains the number of rows to return.")
 
-    calculate_action = _extract_calculate_action(normalized_prompt)
+    calculate_action = _extract_calculate_action(
+        normalized_prompt,
+        source_columns=source_columns,
+        role_columns=role_columns,
+        dataframe_profile=dataframe_profile,
+    )
     if calculate_action is not None:
         actions.append(calculate_action)
         evidence.append("The instruction requests an aggregate calculation.")
@@ -1125,10 +1131,188 @@ def _extract_limit_action(normalized_prompt: str) -> LimitRowsIntent | None:
     return LimitRowsIntent(kind="limit_rows", limit=max(0, limit))
 
 
-def _extract_calculate_action(normalized_prompt: str) -> CalculateIntent | None:
-    if not re.search(r"\b(?:sum|total|average|avg|mean|count)\b", normalized_prompt, flags=re.IGNORECASE):
+def _extract_calculate_action(
+    normalized_prompt: str,
+    source_columns: list[str] | None = None,
+    role_columns: dict[str, list[str]] | None = None,
+    dataframe_profile: dict[str, Any] | None = None,
+) -> CalculateIntent | None:
+    """Extract structured calculation operations from user prompt.
+
+    Handles:
+    - Basic aggregates: sum, average, mean, count, median, min, max
+    - Percentage/conditional percentage queries
+    - Quarterly revenue/aggregation queries
+    - Ratio and difference queries
+
+    Returns structured operations (dicts) that the compiler can process,
+    rather than raw prompt strings.
+    """
+    source_columns = source_columns or []
+    source_lower = {c.lower(): c for c in source_columns}
+
+    operations: list[dict] = []
+
+    # --- Percentage-based demographic calculations ---
+    pct_match = re.search(
+        r"\bpercentage\s+of\s+(?P<denom_group>\w+)?\s*(?:employees?|workers?|staff|people|records?|rows?)?\s*"
+        r"(?:who\s+are|that\s+are|which\s+are|having|with)\s+(?P<value>\w+)",
+        normalized_prompt,
+        re.IGNORECASE,
+    )
+    if pct_match:
+        denom_group = (pct_match.group("denom_group") or "").strip().lower()
+        target_value = pct_match.group("value").strip().lower()
+
+        # Determine filter and denominator columns from source data
+        filter_column = _find_column_for_value(target_value, source_columns, dataframe_profile)
+        denom_filter_column = None
+        denom_filter_value = None
+
+        # "percentage of female employees who are single" → denominator = female
+        if denom_group and denom_group not in {"total", "all", "overall", "entire"}:
+            denom_filter_column = _find_column_for_value(denom_group, source_columns, dataframe_profile)
+            denom_filter_value = denom_group
+
+        op = {
+            "type": "conditional_percentage",
+            "column": filter_column or (source_columns[0] if source_columns else "id"),
+            "filter_column": filter_column or "status",
+            "filter_value": target_value,
+        }
+        if denom_filter_column:
+            op["denominator_filter_column"] = denom_filter_column
+            op["denominator_filter_value"] = denom_filter_value
+        operations.append(op)
+
+    # --- Quarterly revenue/aggregation ---
+    quarterly_match = re.search(
+        r"\b(?:quarterly|quarter[- ]?wise|by\s+quarter|per\s+quarter)\s*"
+        r"(?:revenue|sales|income|amount|total|sum|count|average|mean)?",
+        normalized_prompt,
+        re.IGNORECASE,
+    )
+    if not quarterly_match:
+        quarterly_match = re.search(
+            r"\b(?:revenue|sales|income|amount|total)\s*(?:by|per|for\s+each)\s*quarter",
+            normalized_prompt,
+            re.IGNORECASE,
+        )
+    if quarterly_match:
+        # Find date and numeric columns
+        date_col = _find_date_column(source_columns, dataframe_profile)
+        numeric_col = _find_revenue_column(normalized_prompt, source_columns, dataframe_profile)
+
+        if date_col and numeric_col:
+            op_type = "quarterly_sum"
+            if re.search(r"\b(?:average|avg|mean)\b", normalized_prompt, re.IGNORECASE):
+                op_type = "quarterly_mean"
+            elif re.search(r"\bcount\b", normalized_prompt, re.IGNORECASE):
+                op_type = "quarterly_count"
+            operations.append({
+                "type": op_type,
+                "column": numeric_col,
+                "date_column": date_col,
+            })
+
+    # --- Basic aggregates (existing but now structured) ---
+    if not operations:
+        basic_agg = re.search(
+            r"\b(?P<op>sum|total|average|avg|mean|count|median|min|max|minimum|maximum)\b"
+            r"(?:\s+of)?\s*(?P<col>\w+)?",
+            normalized_prompt,
+            re.IGNORECASE,
+        )
+        if basic_agg:
+            op_name = basic_agg.group("op").lower()
+            col_name = (basic_agg.group("col") or "").strip().lower()
+
+            op_map = {
+                "sum": "sum", "total": "sum",
+                "average": "mean", "avg": "mean", "mean": "mean",
+                "count": "count",
+                "median": "median",
+                "min": "min", "minimum": "min",
+                "max": "max", "maximum": "max",
+            }
+            calc_type = op_map.get(op_name, "sum")
+
+            # Resolve column name
+            resolved_col = source_lower.get(col_name, col_name) if col_name else None
+            if not resolved_col and source_columns:
+                # Try to find a numeric column
+                resolved_col = _find_revenue_column(normalized_prompt, source_columns, dataframe_profile)
+
+            if resolved_col:
+                operations.append({"type": calc_type, "column": resolved_col})
+
+    if not operations:
+        # Fallback: detect any calculation keywords and return raw
+        if re.search(r"\b(?:sum|total|average|avg|mean|count|percentage|percent|quarterly|ratio)\b",
+                     normalized_prompt, re.IGNORECASE):
+            return CalculateIntent(kind="calculate", operations=[normalized_prompt])
         return None
-    return CalculateIntent(kind="calculate", operations=[normalized_prompt])
+
+    return CalculateIntent(kind="calculate", operations=operations)
+
+
+def _find_column_for_value(value: str, source_columns: list[str], profile: dict | None) -> str | None:
+    """Find which column likely contains the given value based on the data profile."""
+    if not profile:
+        return None
+    columns_info = profile.get("columns", [])
+    if isinstance(columns_info, list):
+        for col_info in columns_info:
+            if not isinstance(col_info, dict):
+                continue
+            col_name = col_info.get("name", "")
+            samples = col_info.get("sample_values", [])
+            if any(value.lower() in str(s).lower() for s in samples):
+                return col_name
+    # Fallback: try column name matching
+    for col in source_columns:
+        if value.lower() in col.lower():
+            return col
+    return None
+
+
+def _find_date_column(source_columns: list[str], profile: dict | None) -> str | None:
+    """Find the most likely date column."""
+    date_keywords = {"date", "time", "timestamp", "created", "period", "month", "year", "day"}
+    for col in source_columns:
+        if any(kw in col.lower() for kw in date_keywords):
+            return col
+    if profile:
+        columns_info = profile.get("columns", [])
+        if isinstance(columns_info, list):
+            for col_info in columns_info:
+                if isinstance(col_info, dict):
+                    if col_info.get("detected_type") in {"date", "datetime"}:
+                        return col_info.get("name")
+                    if col_info.get("semantic_type_hint") in {"transaction_date", "date"}:
+                        return col_info.get("name")
+    return None
+
+
+def _find_revenue_column(prompt: str, source_columns: list[str], profile: dict | None) -> str | None:
+    """Find the most likely revenue/amount numeric column."""
+    revenue_keywords = {"revenue", "sales", "income", "amount", "price", "total", "profit", "cost"}
+    # Check if prompt mentions a specific column
+    for col in source_columns:
+        if col.lower() in prompt.lower():
+            return col
+    # Match by keyword
+    for col in source_columns:
+        if any(kw in col.lower() for kw in revenue_keywords):
+            return col
+    # Fallback: first numeric column from profile
+    if profile:
+        columns_info = profile.get("columns", [])
+        if isinstance(columns_info, list):
+            for col_info in columns_info:
+                if isinstance(col_info, dict) and col_info.get("detected_type") == "number":
+                    return col_info.get("name")
+    return None
 
 
 def _extract_visualize_action(
@@ -1264,6 +1448,15 @@ _SELECT_ALL_PATTERNS = (
     r"\bkeep every field\b",
 )
 
+_RETURN_ROWS_PATTERNS = (
+    r"\breturn\s+(?:me\s+)?(?:the\s+)?(?:only\s+)?(?:the\s+)?rows\b",
+    r"\bgive\s+(?:me\s+)?(?:the\s+)?rows\b",
+    r"\bshow\s+(?:me\s+)?(?:the\s+)?rows\b",
+    r"\bget\s+(?:me\s+)?(?:the\s+)?rows\b",
+    r"\breturn\s+(?:me\s+)?(?:the\s+)?data\b",
+    r"\breturn\s+(?:me\s+)?(?:the\s+)?records\b",
+)
+
 
 def _repair_select_all_projection(
     canonical_intent: dict[str, Any],
@@ -1274,7 +1467,11 @@ def _repair_select_all_projection(
     if not isinstance(canonical_intent, dict):
         return canonical_intent
     normalized_instruction = _normalize_text(instruction)
-    if not any(re.search(pattern, normalized_instruction) for pattern in _SELECT_ALL_PATTERNS):
+
+    explicit_all = any(re.search(pattern, normalized_instruction) for pattern in _SELECT_ALL_PATTERNS)
+    implicit_all = any(re.search(pattern, normalized_instruction, re.IGNORECASE) for pattern in _RETURN_ROWS_PATTERNS)
+
+    if not explicit_all and not implicit_all:
         return canonical_intent
 
     actions = canonical_intent.get("actions")
@@ -1282,7 +1479,8 @@ def _repair_select_all_projection(
         return canonical_intent
 
     repaired = False
-    for action in actions:
+    actions_to_remove: list[int] = []
+    for idx, action in enumerate(actions):
         if not isinstance(action, dict) or str(action.get("kind", "")).strip() != "project_columns":
             continue
         fields = action.get("requested_fields")
@@ -1294,13 +1492,21 @@ def _repair_select_all_projection(
             raw_reference = _normalize_text(str(field.get("raw_reference", "")))
             if raw_reference not in {"all", "all columns", "every column", "all fields", "every field", "everything"}:
                 continue
-            field["raw_reference"] = "all columns"
-            field["resolution_method"] = "all_columns"
-            field["selection_mode"] = "semantic_family"
-            field["resolved_column"] = None
-            field["resolved_columns"] = [str(column) for column in source_columns if str(column).strip()]
-            field["candidate_columns"] = [str(column) for column in source_columns if str(column).strip()]
-            repaired = True
+
+            if implicit_all and not explicit_all:
+                actions_to_remove.append(idx)
+                repaired = True
+            else:
+                field["raw_reference"] = "all columns"
+                field["resolution_method"] = "all_columns"
+                field["selection_mode"] = "semantic_family"
+                field["resolved_column"] = None
+                field["resolved_columns"] = [str(column) for column in source_columns if str(column).strip()]
+                field["candidate_columns"] = [str(column) for column in source_columns if str(column).strip()]
+                repaired = True
+
+    if actions_to_remove:
+        canonical_intent["actions"] = [a for i, a in enumerate(actions) if i not in actions_to_remove]
 
     if not repaired:
         return canonical_intent
@@ -1442,6 +1648,46 @@ def _repair_profile_grounded_references(
         and str(canonical_intent.get("resolution_status", "")).strip() == "needs_clarification"
     ):
         canonical_intent["resolution_status"] = "repaired"
+
+    return canonical_intent
+
+
+def _repair_missing_clean_action(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+) -> dict[str, Any]:
+    """Inject a safe_default clean action if the user explicitly requests cleaning
+    but the semantic pipeline didn't extract one."""
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    normalized = _normalize_text(instruction)
+    if not re.search(
+        r"\b(?:clean(?:\s+(?:the|my|this))?\s+(?:data|file|sheet|table|dataset)|"
+        r"clean\s+up|cleanup|cleanse|sanitize|standardize|normalise|normalize)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    for action in actions:
+        if isinstance(action, dict) and str(action.get("kind", "")).strip() == "clean":
+            return canonical_intent
+
+    clean_action = {"kind": "clean", "mode": "safe_default", "operations": []}
+    actions.insert(0, clean_action)
+    canonical_intent["actions"] = actions
+
+    evidence = canonical_intent.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence.append("Injected clean action: user explicitly requested data cleaning.")
+    canonical_intent["evidence"] = evidence
 
     return canonical_intent
 
